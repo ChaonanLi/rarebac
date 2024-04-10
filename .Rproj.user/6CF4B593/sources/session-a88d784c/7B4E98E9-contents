@@ -1,0 +1,21 @@
+# A regression model predicting ozone levels
+data(airquality)
+ozone.rp <- rfPermute(Ozone ~ ., data = airquality, na.action = na.omit, ntree = 100, num.rep = 50)
+ozone.rp
+
+# Plot the scaled importance distributions 
+# Significant (p <= 0.05) predictors are in red
+plotImportance(ozone.rp, scale = TRUE)
+
+# Plot the importance null distributions and observed values for two of the predictors
+plotNull(ozone.rp, preds = c("Solar.R", "Month"))
+
+
+# A classification model classifying cars to manual or automatic transmission 
+data(mtcars)
+
+am.rp <- rfPermute(factor(am) ~ ., mtcars, ntree = 100, num.rep = 50)
+summary(am.rp)
+
+
+plotImportance(am.rp, scale = TRUE, sig.only = TRUE)

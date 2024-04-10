@@ -1,0 +1,488 @@
+# Load Required Packages 
+require(fdrtool)
+
+
+## 生成每一组的显著性字母标记
+cldList = function(formula = NULL, data = NULL, comparison = NULL, p.value = NULL, 
+                   threshold = 0.05,print.comp = FALSE, remove.space  = TRUE,
+                   remove.equal = TRUE, remove.zero  = TRUE, swap.colon = TRUE,
+                   swap.vs = FALSE, ...){
+  if(!is.null(formula)){
+    p.value     = eval(parse(text=paste0("data","$",all.vars(formula[[2]])[1])))
+    comparison  = eval(parse(text=paste0("data","$",all.vars(formula[[3]])[1])))
+  }
+  Comparison = (as.numeric(p.value) <= threshold)
+  
+  if (sum(Comparison) == 0){
+    #stop("No significant differences.", call.=FALSE)
+    return(0)
+  }
+  
+  if(remove.space == TRUE) {comparison = gsub(" ",  "",  comparison)}
+  if(remove.equal == TRUE) {comparison = gsub("=",  "",  comparison)}
+  if(remove.zero  == TRUE) {comparison = gsub("0",  "",  comparison)}
+  if(swap.colon   == TRUE) {comparison = gsub(":",  "-", comparison)}
+  if(swap.vs      == TRUE) {comparison = gsub("vs", "-", comparison)}
+  
+  names(Comparison) = comparison
+  
+  if(print.comp == TRUE) 
+  {Y = data.frame(Comparisons = names(Comparison), 
+                  p.value = p.value, Value=Comparison,
+                  Threshold=threshold)
+  cat("\n", "\n")
+  print(Y)
+  cat("\n", "\n")}
+  
+  MCL = multcompLetters(Comparison, ...)
+  
+  Group      = names(MCL$Letters)
+  Letter     = as.character(MCL$Letters)
+  MonoLetter = as.character(MCL$monospacedLetters)
+  
+  Z = data.frame(Group, Letter, MonoLetter)
+  
+  return(Z)
+}
+
+# 调用cldList函数来生成每一个分组的显著性字母标记信息 
+getAlphaBeta <- function(RstDf, testVarCol, GroupA_col, GroupB_col, Pvalue_col, cutoffs = 0.05){
+  require(multcompView)
+  # 处理一下分组，注意分组名称不能以数字开头和结尾
+  df <- data.frame(Compare = paste(RstDf[,GroupA_col], 
+                                   RstDf[,GroupB_col], sep = " - "), 
+                   P = RstDf[,Pvalue_col], 
+                   var = RstDf[,testVarCol])
+  pV <- df$P
+  for (i in seq(length(pV))){
+    if (is.na(pV[i])){
+      pV[i] <- 1
+    }
+  }
+  df$P <- pV
+  
+  # 循环地计算
+  res.final <- NULL
+  uniqueVar <- unique(df$var)
+  for (i in seq(length(uniqueVar))){
+    currentVar <- uniqueVar[i]
+    currentTab <- df[which(df$var == currentVar),]
+    res <- cldList(P ~ Compare, data = currentTab, threshold = cutoffs, remove.zero = FALSE)
+    if (typeof(res) == "double"){
+      currentTabVar <- strsplit(as.vector(currentTab$Compare), split = ' - ', fixed = T)
+      allV <- c()
+      for (j in seq(length(currentTabVar))){
+        allV <- c(allV, currentTabVar[[j]])
+      }
+      allV <- unique(allV)
+      res <- data.frame(Group = allV, Letter = rep('', length(allV)))
+    }else{
+      res <- res[,1:2]
+    }
+    res$Var <- rep(currentVar, nrow(res))
+    res.final <- rbind(res.final, res)
+  }
+  res.final
+}
+
+## 添加显著标记到均值数据框上
+addSigLabel2MeanTab <- function(alphaBetaDf, meanDf){
+  sig.label <- c()
+  for (i in seq(nrow(meanDf))){
+    type = as.character(meanDf[i, 1])
+    group = as.character(meanDf[i, 2])
+    label = as.character(alphaBetaDf[which(as.vector(alphaBetaDf$Group) == group & as.vector(alphaBetaDf$Var) == type),2])
+    sig.label <- c(sig.label, label)
+  }
+  meanDf$SigLabel <- sig.label
+  return(meanDf)
+}
+
+
+# Randomization Permutation Tests function for the comparing of two groups  
+RPT <- function(measurevar, groupvar, nperm = 999){
+
+  # ---- >> mesaurevar: a vector containing two group values 
+  # ---- >> groupvar: a group vector 
+  
+  # Generate a list filled with 0 
+  mean.diff <- numeric(nperm)
+  
+  # Calcualte the observed difference between two groups
+  obs.mean.diff <- abs(aggregate(measurevar, by = list(groupvar), FUN = mean)$x[1] - aggregate(measurevar, by = list(groupvar), FUN = mean)$x[2])
+  
+  # Permutation starts 
+  for (i in 1:nperm){
+    perm.scores <- sample(measurevar, size = length(measurevar))
+    mean.diff[i] <- diff(tapply(perm.scores, groupvar, mean))
+  }
+  
+  # Calculate p-values 
+  one_tailed_p <- length(mean.diff[mean.diff >= obs.mean.diff])/nperm
+  two_tailed_p <- length(mean.diff[abs(mean.diff) >= obs.mean.diff])/nperm
+  
+  # Return 
+  res <- list()
+  res$obs.mean.diff <- obs.mean.diff
+  res$one_tailed_p <- one_tailed_p
+  res$two_tailed_p <- two_tailed_p
+  return(res)
+}
+
+
+NonparametricPairWiseTest <- function(abund_table, grouping_info, method, group_col, signif = 0.05, FDR_USE = FALSE){
+  
+  # ---->> abund_table: environmental table (dataFrame) with samples as row while variables as column
+  # ---->> grouping_info: The grouping table (Dataframe) with samples as first column; Two columns are necessary 
+  #                    for these functions in scripts at least.
+  # ---->> signif: the significance threshold 
+  # ---->> method: which method would be used for pairwise group comparing
+  #               rpt: Random Permutation Test 
+  #               wrst: Wilcoxon Rank Sum Test
+  #               wsrt: Wilcoxon Signed Rank Test
+  #               kwrst: Kruskal-Wallis Rank Sum Test
+  #
+  
+  # Get group info 
+  group <- as.vector(grouping_info[, group_col])
+  unique_group <- as.vector(unique(group))
+
+  # Establish NULL data frames to save all results 
+  RPT_res <- WRST_res <- WSRT_res <- KWRST_res <- NULL
+
+  # Perform test 
+  for (i in seq(from = 1, to = ncol(abund_table))){
+  
+    # Extract all parameters 
+    all_parameters <- colnames(abund_table)
+  
+    # Get current parameter name
+    current_parameter <- all_parameters[i]
+
+    # Get numeric data of current parameter
+    current_data <- as.numeric(abund_table[,i])
+  
+    # Create two data frame to save RPT and WRST test results 
+    current_rpt_res <- current_wrst_res <- current_wsrt_res <- current_kwrst_res <- NULL
+  
+    # Perform test for current parameter 
+    for (h in seq(from = 1, to = length(unique_group))){
+      for (j in seq(from = h, to = length(unique_group))){
+        if (h != j){
+        
+          # Get comparing group info 
+          comparing_group1 <- as.vector(group[which(group == unique_group[h])])
+          comparing_group2 <- as.vector(group[which(group == unique_group[j])])
+          comparing_group <- as.vector(c(comparing_group1, comparing_group2))
+        
+          # Get row id of associated subset of abundance table 
+          new_grouping_info1 <- grouping_info[grouping_info[, group_col] == unique(comparing_group1),]
+          new_grouping_info2 <- grouping_info[grouping_info[, group_col] == unique(comparing_group2),]
+          sample_row_id <- c(as.numeric(rownames(new_grouping_info1)), as.numeric(rownames(new_grouping_info2)))
+          x_row_id <- as.numeric(rownames(new_grouping_info1))
+          y_row_id <- as.numeric(rownames(new_grouping_info2))
+        
+          # Extract data according row id 
+          rpt_data <- current_data[sample_row_id]
+          wilcox_data_x <- current_data[x_row_id]
+          wilcox_data_y <- current_data[y_row_id]
+        
+          # Calculate mean and sd 
+          wilcox_data_x_mean <- round(mean(wilcox_data_x),3)
+          wilcox_data_y_mean <- round(mean(wilcox_data_y),3)
+          wilcox_data_x_sd <- round(sd(wilcox_data_x),3)
+          wilcox_data_y_sd <- round(sd(wilcox_data_y),3)
+        
+          if (method == 'rpt'){
+            # Performing RPT test 
+            current_rpt <- RPT(rpt_data, comparing_group, nperm = 999)
+            rpt_values <- c(current_parameter,
+                            as.vector(unique(comparing_group))[1],
+                            as.vector(unique(comparing_group))[2], 
+                            wilcox_data_x_mean,
+                            wilcox_data_x_sd,
+                            wilcox_data_y_mean,
+                            wilcox_data_y_sd,
+                            round(current_rpt$obs.mean.diff,3), 
+                            round(current_rpt$one_tailed_p,5), 
+                            round(current_rpt$two_tailed_p,5))
+            current_rpt_res <- rbind(current_rpt_res, rpt_values)
+          }
+          
+          if (method == 'wrst'){
+            # The wilcoxon rank sum test would be used 
+            current_wrst <- suppressWarnings(suppressMessages(wilcox.test(x=wilcox_data_x, y=wilcox_data_y, alternative = "two.sided")))
+            wilcox_values1 <- c(current_parameter, 
+                                  as.vector(unique(comparing_group))[1],
+                                  as.vector(unique(comparing_group))[2],
+                                  wilcox_data_x_mean,
+                                  wilcox_data_x_sd,
+                                  wilcox_data_y_mean,
+                                  wilcox_data_y_sd,
+                                  current_wrst$alternative,
+                                  current_wrst$method,
+                                  as.vector(current_wrst$statistic),
+                                  round(current_wrst$p.value, 5))
+            current_wrst_res <- rbind(current_wrst_res, wilcox_values1)
+          }
+          
+          if (method == 'wsrt'){
+            # The wilcoxon signed rank test would be used 
+            current_wsrt <- suppressWarnings(suppressMessages(wilcox.test(x=wilcox_data_x, y=wilcox_data_y, alternative = "two.sided", paired = TRUE)))
+            wilcox_values2 <- c(current_parameter, 
+                                  as.vector(unique(comparing_group))[1], 
+                                  as.vector(unique(comparing_group))[2],
+                                  wilcox_data_x_mean,
+                                  wilcox_data_x_sd,
+                                  wilcox_data_y_mean,
+                                  wilcox_data_y_sd,
+                                  current_wsrt$alternative,
+                                  current_wsrt$method,
+                                  as.vector(current_wsrt$statistic),
+                                  round(current_wsrt$p.value, 5))
+            current_wsrt_res <- rbind(current_wsrt_res, wilcox_values2)        
+          }
+          
+          if (method == 'kwrst'){
+            # The Kruskal-Wallis rank sum test would be used 
+            # The input data set of kruskal.test function is same with RPT test 
+            current_kwrst <- suppressWarnings(suppressMessages(kruskal.test(rpt_data, as.factor(comparing_group), alternative = "two.sided", paired = TRUE)))
+            kruskal_value <- c(current_parameter,
+                               as.vector(unique(comparing_group))[1],
+                               as.vector(unique(comparing_group))[2],
+                               wilcox_data_x_mean,
+                               wilcox_data_x_sd,
+                               wilcox_data_y_mean,
+                               wilcox_data_y_sd,
+                               current_kwrst$method,
+                               as.vector(current_kwrst$statistic),
+                               round(current_kwrst$p.value,5))
+            current_kwrst_res <- rbind(current_kwrst_res, kruskal_value)  
+          }
+        }
+      }
+    }
+  
+    # Combines into one file 
+    if (method == 'rpt'){RPT_res <- rbind(RPT_res, current_rpt_res)}
+    if (method == 'wrst'){WRST_res <- rbind(WRST_res, current_wrst_res)}
+    if (method == 'wsrt'){WSRT_res <- rbind(WSRT_res, current_wsrt_res)}
+    if (method == 'kwrst'){KWRST_res <- rbind(KWRST_res, current_kwrst_res)}
+  }
+
+
+  ## Adjust P-values using FDR
+  # Convert into numeric values
+  if (method == 'rpt'){ 
+    rpt_one_tailed_p <- round(as.numeric(RPT_res[,9]),3)
+    rpt_two_tailed_p <- round(as.numeric(RPT_res[,10]),3)
+  }
+  
+  if (method == 'wrst'){
+    wrst_p <- round(as.numeric(WRST_res[,11]),3)
+  }
+  
+  if (method == 'wsrt'){
+    wsrt_p <- round(as.numeric(WSRT_res[,11]),3)
+  }
+  
+  if (method == 'kwrst'){
+    kwrst_p <- round(as.numeric(KWRST_res[,10]),3)
+  }
+  
+  # Adjust P-values 
+  if (method == 'rpt'){
+    fdr_rpt_one_tailed <- round(p.adjust(rpt_one_tailed_p, 'fdr'),3)
+    fdr_rpt_two_tailed <- round(p.adjust(rpt_two_tailed_p, 'fdr'),3)
+  }
+  
+  if (method == 'wrst'){
+    fdr_wrst <- round(p.adjust(wrst_p,'fdr'),3)
+  }
+  
+  if (method == 'wsrt'){
+    fdr_wsrt <- round(p.adjust(wsrt_p,'fdr'),3)
+  }
+  
+  if (method == 'kwrst'){
+    fdr_kwrst <- round(p.adjust(kwrst_p,'fdr'),3)
+  }
+  
+  # Add adjusted P-values into dataFrame 
+  if (method == 'rpt'){RPT_res <- as.data.frame(cbind(RPT_res, fdr_rpt_one_tailed, fdr_rpt_two_tailed))}
+  if (method == 'wrst'){WRST_res <- as.data.frame(cbind(WRST_res, fdr_wrst))}
+  if (method == 'wsrt'){WSRT_res <- as.data.frame(cbind(WSRT_res, fdr_wsrt))}
+  if (method == 'kwrst'){KWRST_res <- as.data.frame(cbind(KWRST_res, fdr_kwrst))}
+
+  # Set colnames and rownames 
+  if (method == 'rpt'){
+    colnames(RPT_res) <- c("Test Variable", 
+                            "Group A",
+                            "Group B",
+                            "Mean(A)",
+                            "SD(A)",
+                            "Mean(B)",
+                            "SD(B)",
+                            "Observed Diff of Mean",
+                            "One-tailed P-values", 
+                            "Two-tailed P-values", 
+                            "One-tailed FDR",
+                            "Two-tailed FDR")
+    rownames(RPT_res) <- seq(nrow(RPT_res))
+  }
+  
+  if (method == 'wrst'){
+    colnames(WRST_res) <- c("Test Variable", 
+                            "Group A",
+                            "Group B",
+                            "Mean(A)",
+                            "SD(A)",
+                            "Mean(B)",
+                            "SD(B)",
+                            "Alternative",
+                            "Method",
+                            "Statistic W", 
+                            "P-values", 
+                            "FDR")
+    rownames(WRST_res) <- seq(nrow(WRST_res))
+  }
+  
+  if (method == 'wsrt'){
+    colnames(WSRT_res) <- c("Test Variable", 
+                            "Group A",
+                            "Group B",
+                            "Mean(A)",
+                            "SD(A)",
+                            "Mean(B)",
+                            "SD(B)",
+                            "Alternative",
+                            "Method",
+                            "Statistic V", 
+                            "P-values", 
+                            "FDR")
+    rownames(WSRT_res) <- seq(nrow(WSRT_res))
+  }
+  
+  if (method == 'kwrst'){
+    colnames(KWRST_res) <- c("Test Variable", 
+                            "Group A",
+                            "Group B",
+                            "Mean(A)",
+                            "SD(A)",
+                            "Mean(B)",
+                            "SD(B)",
+                            "Method",
+                            "Chi-squared", 
+                            "P-values", 
+                            "FDR")
+    rownames(KWRST_res) <- seq(nrow(KWRST_res))
+  }
+
+  
+  # Convert into data frame 
+  if (method == 'rpt'){RPT_res <- as.data.frame(RPT_res)}
+  if (method == 'wrst'){WRST_res <- as.data.frame(WRST_res)}
+  if (method == 'wsrt'){WSRT_res <- as.data.frame(WSRT_res)}
+  if (method == 'kwrst'){KWRST_res <- as.data.frame(KWRST_res)}
+  
+  # Convert values into numeric 
+  if (method == 'rpt'){
+    RPT_res[,4] <- as.numeric(as.vector(RPT_res[,4]))
+    RPT_res[,5] <- as.numeric(as.vector(RPT_res[,5]))
+    RPT_res[,6] <- as.numeric(as.vector(RPT_res[,6]))
+    RPT_res[,7] <- as.numeric(as.vector(RPT_res[,7]))
+    RPT_res[,8] <- as.numeric(as.vector(RPT_res[,8]))
+    RPT_res[,9] <- as.numeric(as.vector(RPT_res[,9]))
+    RPT_res[,10] <- as.numeric(as.vector(RPT_res[,10]))
+    RPT_res[,11] <- as.numeric(as.vector(RPT_res[,11]))
+    RPT_res[,12] <- as.numeric(as.vector(RPT_res[,12]))
+  }
+  
+  if (method == 'wrst'){
+    WRST_res[,4] <- as.numeric(as.vector(WRST_res[,4]))
+    WRST_res[,5] <- as.numeric(as.vector(WRST_res[,5]))
+    WRST_res[,6] <- as.numeric(as.vector(WRST_res[,6]))
+    WRST_res[,7] <- as.numeric(as.vector(WRST_res[,7]))
+    WRST_res[,10] <- as.numeric(as.vector(WRST_res[,10]))
+    WRST_res[,11] <- as.numeric(as.vector(WRST_res[,11]))
+    WRST_res[,12] <- as.numeric(as.vector(WRST_res[,12]))
+  }
+  
+  if (method == 'wsrt'){
+    WSRT_res[,4] <- as.numeric(as.vector(WSRT_res[,4]))
+    WSRT_res[,5] <- as.numeric(as.vector(WSRT_res[,5]))
+    WSRT_res[,6] <- as.numeric(as.vector(WSRT_res[,6]))
+    WSRT_res[,7] <- as.numeric(as.vector(WSRT_res[,7]))
+    WSRT_res[,10] <- as.numeric(as.vector(WSRT_res[,10]))
+    WSRT_res[,11] <- as.numeric(as.vector(WSRT_res[,11]))
+    WSRT_res[,12] <- as.numeric(as.vector(WSRT_res[,12]))
+  }
+  
+  if (method == 'kwrst'){
+    KWRST_res[,4] <- as.numeric(as.vector(KWRST_res[,4]))
+    KWRST_res[,5] <- as.numeric(as.vector(KWRST_res[,5]))
+    KWRST_res[,6] <- as.numeric(as.vector(KWRST_res[,6]))
+    KWRST_res[,7] <- as.numeric(as.vector(KWRST_res[,7]))
+    KWRST_res[,9] <- as.numeric(as.vector(KWRST_res[,9]))
+    KWRST_res[,10] <- as.numeric(as.vector(KWRST_res[,10]))
+    KWRST_res[,11] <- as.numeric(as.vector(KWRST_res[,11]))
+  }
+   
+  # Extract significant results and wirte into xlsx file 
+  if (FDR_USE){
+    if (method == 'rpt'){
+      sigRPT <- na.omit(RPT_res[RPT_res$`One-tailed FDR` < signif,])
+    }
+    
+    if (method == 'wrst'){
+      sigWRST <- na.omit(WRST_res[WRST_res$FDR < signif,])
+    }
+    
+    if (method == 'wsrt'){
+      sigWSRT <- na.omit(WSRT_res[WSRT_res$FDR < signif,]) 
+    }
+    
+    if (method == 'kwrst'){
+      sigKWRST <- na.omit(KWRST_res[KWRST_res$FDR < signif,])
+    }
+  }else{
+    if (method == 'rpt'){
+      sigRPT <- na.omit(RPT_res[RPT_res$`One-tailed P-values` < signif,])
+    }
+    
+    if (method == 'wrst'){
+      sigWRST <- na.omit(WRST_res[WRST_res$`P-values` < signif,])
+    }
+    
+    if (method == 'wsrt'){
+      sigWSRT <- na.omit(WSRT_res[WSRT_res$`P-values` < signif,]) 
+    }
+    
+    if (method == 'kwrst'){
+      sigKWRST <- na.omit(KWRST_res[KWRST_res$`P-values` < signif,])
+    }
+  }
+
+  # Return test results
+  TestRes <- list()
+  if (method == 'rpt'){
+    TestRes$all_result <- RPT_res
+    TestRes$sig_result <- sigRPT
+  }
+  
+  if (method == 'wrst'){
+    TestRes$all_result <- WRST_res
+    TestRes$sig_result <- sigWRST
+  }
+  
+  if (method == 'wsrt'){
+    TestRes$all_result <- WSRT_res
+    TestRes$sig_result <- sigWSRT
+  }
+  
+  if (method == 'kwrst'){
+    TestRes$all_result <- KWRST_res
+    TestRes$sig_result <- sigKWRST
+  }
+  return(TestRes)
+}

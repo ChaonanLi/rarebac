@@ -1,0 +1,1062 @@
+# 0. 加载必要的R包
+require(magrittr)
+require(microeco)
+require(ggpubr)
+require(ggplot2)
+require(ggpmisc)
+require(ggcorrplot)
+source('utils.r')
+source('vector-test.r')
+source('mantel-test.r')
+
+# 1. 读取原始数据
+outdir_01 <- createDir(rootPath = ".", dir = "results/01.read-files") # 创建结果目录
+dataset_file <- file.path(outdir_01, "forest-gap-fungal-dataset.Rds")
+if (!file.exists(dataset_file)){
+
+    ## 读取细根降解速残留率数据
+    dcp_table <- xlsx::read.xlsx("../../../metdata/metadata-forest-gap.xlsx", sheetIndex = 3, as.data.frame = T)
+    rownames(dcp_table) <- dcp_table$ExperID
+    dcp_table$Mon.3.ratio <- dcp_table$Mon.3/dcp_table$Init
+    dcp_table$Mon.24.ratio <- dcp_table$Mon.24/dcp_table$Init
+    dcp_table <- dcp_table[,c("ExperID", "Mon.3.ratio", "Mon.24.ratio")]
+    dcp_table <- data.frame(ExperID = rep(dcp_table$ExperID, 2), DRR = c(dcp_table$Mon.3.ratio, dcp_table$Mon.24.ratio),
+                            Time = rep(c("Mon.3", "Mon.24"), each = nrow(dcp_table)))
+    dim(dcp_table)
+
+    ## 读取分组和环境参数表
+    met_table <- xlsx::read.xlsx("../../../metdata/metadata-forest-gap.xlsx", sheetIndex = 2, as.data.frame = T)
+    rownames(met_table) <- met_table$SampleID
+
+    ## 将分 信 息表拆分出来
+    gro_table <- met_table[,1:4]
+    gro_table$Group <- paste0(gro_table$GapLoc, "_", gro_table$Time)
+    gro_table <- gro_table[which(gro_table$Time == 'Mon.24'),]
+    gro_table <- gro_table[,c("SampleID", "ExperID", "GapLoc")]
+    colnames(gro_table)[3] <- "Group"
+
+    ## 将环境信息表拆分出来
+    sol_var <- c("ST", "SWC", "pH", "SOC", "STN", "SNP")
+    pln_var <- c("RTC", "RTN", "RCN", "RCa", "RMg", "RLig", "RCel", "RHem")
+    env_table <- met_table # 所有参数
+    sol_table <- met_table[,sol_var] # 土壤参数
+    pln_table <- met_table[,pln_var] # 植被参数
+
+    ## 根据`gro_table`整理一下细根降解速残留率数据
+    drr_table <- lapply(X = seq(nrow(gro_table)), function(x){
+        SampleID <- gro_table$SampleID[x]
+        ExperID <- gro_table$ExperID[x]
+        dcp <- dcp_table[which(dcp_table$ExperID == ExperID & dcp_table$Time == "Mon.24"),]
+        DRR <- ifelse(nrow(dcp) == 0, NA, dcp$DRR)
+        data.frame(row.names = SampleID, SampleID = SampleID, DRR = DRR)
+    }) %>% do.call('rbind', .)
+    drr_table$DRR <- 1 - drr_table$DRR
+
+    ## 读取进化树
+    tre_table <- ape::read.tree("../../../reports/06.phylotree/tree.nwk")
+
+    ## 读取OTU丰度表
+    otu_table <- read.table("../../../reports/03.feature-table/feature-table-resampled-14899.tsv",
+                            header = T, sep = '\t', comment.char = "", skip = 1)
+    rownames(otu_table) <- otu_table$X.OTU.ID; otu_table <- otu_table[,-1] ; otu_table <- t(otu_table)
+
+    ## 读取物种分类信息表
+    tax_table <- data.table::fread("../../../reports/04.feature-annotation/taxonomy.tsv", sep = '\t') %>% as.data.frame
+    rownames(tax_table) <- tax_table$`Feature ID`
+    tax_table <- tax_table[colnames(otu_table),]
+    tax_table %>% dim
+
+    ## 处理物种分类信息表
+    tax_rst <- lapply(X = tax_table %>% nrow %>% seq, function(x){
+        tax_res <- tax_table$Taxon[x] %>% strsplit(., split = ";", fixed = T) %>% unlist
+        if (tax_res %>% length < 7) tax_res <- c(tax_res, rep(NA, 7 - length(tax_res)))
+        tax_res %<>% as.data.frame %>% t
+        colnames(tax_res) <- c('Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')
+        rownames(tax_res) <- rownames(tax_table)[x]
+        tax_res[1,] <- lapply(tax_res[1,], function(col) gsub("^(k__|p__|c__|o__|f__|g__|s__)", "", col)) %>% unlist
+        tax_res
+    }) %>% do.call('rbind', .)
+    tax_table <- cbind(tax_table, tax_rst)
+    tax_table <- tax_table[,-c(1, 2, 3)]
+    tax_table %>% dim
+
+    ## 计算可用样本: 取分组表和otu表中样本编号交集
+    sampleIDs <- intersect(gro_table %>% rownames, otu_table %>% rownames)
+    sampleIDs %>% length # 35
+
+    ## 排序
+    gro_table <- gro_table[sampleIDs,]
+    env_table <- env_table[sampleIDs,]
+    sol_table <- sol_table[sampleIDs,]
+    pln_table <- pln_table[sampleIDs,]
+    drr_table <- drr_table[sampleIDs,]
+    if (length(unique(rownames(pln_table) == rownames(drr_table))) > 1 ||
+        !unique(rownames(pln_table) == rownames(drr_table))){
+        stop('error!')
+    }
+    pln_table$DRR <- drr_table$DRR
+    otu_table <- otu_table[sampleIDs,]; otu_table <- otu_table[,apply(otu_table, 2, sum) > 0]
+    tax_table <- tax_table[colnames(otu_table),]
+
+    ## 检查样本和OTU编号顺序：以`gro_table`中的样本顺序为标准；以`otu_table`中的ASV编号顺序为标准
+    if (length(unique(rownames(otu_table) == rownames(gro_table))) > 1 || !unique(rownames(otu_table) == rownames(gro_table))){
+        stop("sample order error!")
+    }
+    if (length(unique(rownames(env_table) == rownames(gro_table))) > 1 || !unique(rownames(env_table) == rownames(gro_table))){
+        stop("sample order error!")
+    }
+    if (length(unique(rownames(sol_table) == rownames(gro_table))) > 1 || !unique(rownames(sol_table) == rownames(gro_table))){
+        stop("sample order error!")
+    }
+    if (length(unique(rownames(pln_table) == rownames(gro_table))) > 1 || !unique(rownames(pln_table) == rownames(gro_table))){
+        stop("sample order error!")
+    }
+    if (length(unique(rownames(tax_table) == colnames(otu_table))) > 1 || !unique(rownames(tax_table) == colnames(otu_table))){
+        stop("asv order error!")
+    }
+
+    ## 设置颜色和显示顺序
+    args <- list(
+        sol_var = c("ST","SWC","pH","SOC","STN","SNP"),
+        pln_var = c("DRR",pln_var),
+        gap_order = c('CC','GC', 'GB'),
+        gap_color = RColorBrewer::brewer.pal(8, "Dark2")[1:3]
+    )
+
+    ## 创建microeco数据集并预测功能: lifestyle
+    dataset <- microtable$new(otu_table = t(otu_table) %>% as.data.frame, sample_table = gro_table, tax_table = tax_table, phylo_tree = tre_table)
+    dataset$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+    dataset$tax_table %<>% .[grepl("Fungi", .$Kingdom), ]
+    dataset$tax_table %<>% tidy_taxonomy()
+    dataset$tidy_dataset()
+    dataset$cal_abund()
+    dataset$cal_alphadiv(PD = TRUE)
+    dataset$cal_betadiv(unifrac = TRUE)
+    datasets <- list(microgeo = dataset,
+                     metadata = list(env = cbind(sol_table, pln_table), sol = sol_table, pln = pln_table),
+                     argument = args)
+    saveRDS(object = datasets, file = dataset_file)
+}else{
+    datasets <- readRDS(file = dataset_file)
+}
+args <- datasets$argument
+dataset <- datasets$microgeo
+env_table <- datasets$metadata$env[,which(colnames(datasets$metadata$env) != 'DRR')]
+sol_table <- datasets$metadata$sol
+pln_table <- datasets$metadata$pln
+
+# 2. 环境参数分析
+## 创建结果目录
+outdir_02 <- createDir(rootPath = ".", dir = "results/02.env-sums")
+
+## 计算环境参数的欧式距离
+sol_eucl_dist <- sol_table %>% vegan::decostand(method = "standardize") %>% dist %>% as.matrix
+pln_eucl_dist <- pln_table[,args$pln_var[args$pln_var != 'DRR']] %>% vegan::decostand(method = "standardize") %>% dist %>% as.matrix
+env_eucl_dist <- env_table %>% vegan::decostand(method = "standardize") %>% dist %>% as.matrix
+if (length(unique(rownames(dataset$sample_table) == rownames(sol_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(sol_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(sol_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(sol_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == rownames(pln_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(pln_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(pln_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(pln_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == rownames(env_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(env_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(env_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(env_eucl_dist))) stop("sample id order error!")
+dataset$beta_diversity$sol_eucl <- sol_eucl_dist
+dataset$beta_diversity$pln_eucl <- pln_eucl_dist
+dataset$beta_diversity$env_eucl <- env_eucl_dist
+
+## 环境参数的PCoA分析
+pcoa_sol <- trans_beta$new(dataset = dataset, measure = "sol_eucl", group = "Group")
+pcoa_pln <- trans_beta$new(dataset = dataset, measure = "pln_eucl", group = "Group")
+pcoa_env <- trans_beta$new(dataset = dataset, measure = "env_eucl", group = "Group")
+pcoa_sol$cal_ordination(ordination = "PCoA")
+pcoa_pln$cal_ordination(ordination = "PCoA")
+pcoa_env$cal_ordination(ordination = "PCoA")
+pcoa_sol$res_ordination$scores$Group <- factor(pcoa_sol$res_ordination$scores$Group, levels = args$gap_order)
+pcoa_pln$res_ordination$scores$Group <- factor(pcoa_pln$res_ordination$scores$Group, levels = args$gap_order)
+pcoa_env$res_ordination$scores$Group <- factor(pcoa_env$res_ordination$scores$Group, levels = args$gap_order)
+(p_pcoa_sol <- pcoa_sol$plot_ordination(plot_color = "Group", plot_shape = "Group",
+                                        plot_type = c("point", "chull"), point_size = 2, color_values = args$gap_color))
+(p_pcoa_pln <- pcoa_pln$plot_ordination(plot_color = "Group", plot_shape = "Group",
+                                        plot_type = c("point", "chull"), point_size = 2, color_values = args$gap_color))
+(p_pcoa_env <- pcoa_env$plot_ordination(plot_color = "Group", plot_shape = "Group",
+                                        plot_type = c("point", "chull"), point_size = 2, color_values = args$gap_color))
+
+## 环境参数的ANOISIM检验
+pcoa_sol$cal_anosim(group = "Group", paired = TRUE)
+pcoa_pln$cal_anosim(group = "Group", paired = TRUE)
+pcoa_env$cal_anosim(group = "Group", paired = TRUE)
+saveMutipleXlsx(objectList = list(sol_ANOSIM = pcoa_sol$res_anosim,
+                                  pln_ANOSIM = pcoa_pln$res_anosim,
+                                  env_ANOSIM = pcoa_env$res_anosim),
+                path = outdir_02, filename = '土壤参数-根参数-欧式距离-ANOSIM检验.xlsx', row.names = F, col.names = T)
+
+## 环境参数组间欧式距离比较
+bet_sol <- trans_beta$new(dataset = dataset, group = "Group", measure = "sol_eucl")
+bet_pln <- trans_beta$new(dataset = dataset, group = "Group", measure = "pln_eucl")
+bet_env <- trans_beta$new(dataset = dataset, group = "Group", measure = "env_eucl")
+bet_sol$cal_group_distance(within_group = FALSE)
+bet_pln$cal_group_distance(within_group = FALSE)
+bet_env$cal_group_distance(within_group = FALSE)
+dist_sol <- bet_sol$res_group_distance
+dist_pln <- bet_pln$res_group_distance
+dist_env <- bet_env$res_group_distance
+dist_sol <- dist_sol[which(dist_sol$Group != "GC vs GB"),]
+dist_pln <- dist_pln[which(dist_pln$Group != "GC vs GB"),]
+dist_env <- dist_env[which(dist_env$Group != "GC vs GB"),]
+dist_sol$Group <- factor(dist_sol$Group, levels = c("GC vs CC", "GB vs CC"))
+dist_pln$Group <- factor(dist_pln$Group, levels = c("GC vs CC", "GB vs CC"))
+dist_env$Group <- factor(dist_env$Group, levels = c("GC vs CC", "GB vs CC"))
+compare_list <- list(c("GC vs CC", "GB vs CC"))
+(p_bet_sol <- ggplot(dist_sol, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("Euclidean distance") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_bet_pln <- ggplot(dist_pln, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("Euclidean distance") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_bet_env <- ggplot(dist_env, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("Euclidean distance") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 环境参数组内欧式距离比较
+bet_sol_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "sol_eucl")
+bet_pln_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "pln_eucl")
+bet_env_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "env_eucl")
+bet_sol_wit$cal_group_distance(within_group = TRUE)
+bet_pln_wit$cal_group_distance(within_group = TRUE)
+bet_env_wit$cal_group_distance(within_group = TRUE)
+dist_sol_wit <- bet_sol_wit$res_group_distance
+dist_pln_wit <- bet_pln_wit$res_group_distance
+dist_env_wit <- bet_env_wit$res_group_distance
+dist_sol_wit$Group <- factor(dist_sol_wit$Group, levels = args$gap_order)
+dist_pln_wit$Group <- factor(dist_pln_wit$Group, levels = args$gap_order)
+dist_env_wit$Group <- factor(dist_env_wit$Group, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_wit_sol <- ggplot(dist_sol_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("Euclidean distance") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_wit_pln <- ggplot(dist_pln_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("Euclidean distance") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_wit_env <- ggplot(dist_env_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("Euclidean distance") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 环境参数观测值的组间比较
+meta_sol <- data.frame(group = dataset$sample_table$Group, sol_table) %>% reshape2::melt()
+meta_pln <- data.frame(group = dataset$sample_table$Group, pln_table) %>% reshape2::melt()
+meta_sol$group <- factor(meta_sol$group, levels = args$gap_order)
+meta_pln$group <- factor(meta_pln$group, levels = args$gap_order)
+meta_sol$variable <- factor(meta_sol$variable, levels = args$sol_var)
+meta_pln$variable <- factor(meta_pln$variable, levels = args$pln_var)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_sol_syms <- ggplot(meta_sol, aes(x = group, y = value)) + geom_boxplot(aes(fill = group), outlier.size = 0.5) +
+        ylab("Observed values") + scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()) +
+        facet_wrap(~variable, ncol = 6, scales = 'free_y'))
+(p_pln_syms <- ggplot(meta_pln[which(meta_pln$variable != 'DRR'),], aes(x = group, y = value)) +
+        geom_boxplot(aes(fill = group), outlier.size = 0.5) +
+        ylab("Observed values") + scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()) +
+        facet_wrap(~variable, nrow = 1, scales = 'free_y'))
+(p_pln_drr <- ggplot(meta_pln[which(meta_pln$variable == 'DRR'),], aes(x = group, y = value)) +
+        geom_boxplot(aes(fill = group), outlier.size = 0.5) +
+        scale_y_continuous(labels = function(x) x * 100) +
+        ylab("Degradation rate of fine root (%)") + scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()))
+
+## DRR变化的关键驱动因子：Spearman相关分析
+sol_tab_with_drr <- data.frame(DRR = pln_table$DRR, sol_table, pln_table[,which(colnames(pln_table) != 'DRR')])
+corr_data_drr <- psych::corr.test(sol_tab_with_drr %>% na.omit, method = 'spearman')
+(p_cor_drr <- ggcorrplot(corr_data_drr$r, type = "upper", p.mat = corr_data_drr$p, outline.color = "grey20", lab = TRUE, sig.level = 0.05) +
+        scale_fill_gradientn(colors =  RColorBrewer::brewer.pal(11, "Spectral") %>% rev,name = NULL) + theme_gray() +
+        theme(legend.position = c(0.8, 0.25), axis.title = element_blank()))
+sol_tab_with_drr.regdat <- sol_tab_with_drr[,c("DRR", "RTC", "RTN", "RCN", "RMg", "RLig", "RCel")]
+sol_tab_with_drr.regdat$DRR <- as.character(sol_tab_with_drr.regdat$DRR)
+sol_tab_with_drr.regdat <- reshape2::melt(sol_tab_with_drr.regdat)
+sol_tab_with_drr.regdat$DRR <- as.numeric(sol_tab_with_drr.regdat$DRR)
+sol_tab_with_drr.regdat$variable <- factor(sol_tab_with_drr.regdat$variable,
+                                           levels = c("RLig", "RTN", "RTC", "RCN", "RMg", "RCel"))
+(p_max_env_reg.drr <- ggplot(sol_tab_with_drr.regdat, aes(x = value, y = DRR)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') + ylab("Degradation rate of fine root (%)") +
+        scale_y_continuous(labels = function(x) x * 100) +
+        theme(axis.text = element_text(size = 10),
+              axis.title = element_text(size = 12),
+              strip.text = element_text(size = 12), axis.title.x = element_blank()) +
+        facet_wrap(~variable, scales = 'free_x', nrow = 2))
+
+## 合并环境参数分析结果图
+(p_env_dist <- cowplot::plot_grid(p_pcoa_env + theme(legend.position = c(0.3, 0.5)), p_wit_env, p_bet_env,
+                                  p_pcoa_sol + theme(legend.position = c(0.7, 0.26)), p_wit_sol, p_bet_sol,
+                                  p_pcoa_pln + theme(legend.position = c(0.2, 0.3)), p_wit_pln, p_bet_pln,
+                                  rel_widths = c(3,3,2), ncol = 3,
+                                  labels = c("A", "B", "C", "D", "E", "F", "G", "H", "I"), align = 'hv'))
+(p_env_syms <- cowplot::plot_grid(p_sol_syms, p_pln_syms,
+                                  nrow = 2, labels = c("A", "B"), align = 'hv'))
+saved <- savePDF(object = p_env_dist, path = outdir_02,
+                 filename = '环境参数整体差异比较.pdf', width = 9.22, height = 9.89)
+saved <- savePDF(object = p_env_syms, path = outdir_02,
+                 filename = '环境参数观测值差异比较.pdf', width = 12.47, height = 8.61)
+saved <- savePDF(object = p_pln_drr, path = outdir_02,
+                 filename = '细根降解率.pdf', width = 4.32, height = 6.14)
+saved <- savePDF(object = p_cor_drr, path = outdir_02,
+                 filename = '细根降解率相关分析.pdf', width = 7.96, height = 7.96)
+saved <- savePDF(object = p_max_env_reg.drr, path = outdir_02,
+                 filename = '细根降解率回归分析.pdf', width = 9.8, height = 4.41)
+
+# 3. 群落结构变异及其关键驱动因素分析
+outdir_03 <- createDir(rootPath = '.', dir = "results/03.fun-coms")
+
+## Alpha多样性分布模式: 箱线图
+t_alpha <- trans_alpha$new(dataset = dataset, group = "Group")
+t_alpha$cal_diff(method = "wilcox", p_adjust_method = 'fdr')
+t_alpha$data_alpha$Group <- factor(t_alpha$data_alpha$Group, levels = args$gap_order)
+(p_alpha <- t_alpha$plot_alpha(measure = "Observed", add_sig_label = "Significance", boxplot_add = "dotplot") + theme_gray() +
+        ylab("Observed ASV") + scale_color_manual(values = args$gap_color) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = 'none', axis.title.x = element_blank()))
+
+## Alpha多样性分布模式: Veen图
+dataset_veen <- dataset$merge_samples(use_group = "Group")
+t1 <- trans_venn$new(dataset_veen, ratio = NULL)
+(p_veen <- t1$plot_venn() + theme_gray() +
+        theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank()))
+
+## Alpha多样性变化的关键驱动因子：Spearman相关分析
+sol_tab_with_alpha <- data.frame(Observed = dataset$alpha_diversity$Observed, sol_table, pln_table[,which(colnames(pln_table) != 'DRR')])
+corr_data_alpha <- psych::corr.test(sol_tab_with_alpha, method = 'spearman')
+(p_cor_alpha <- ggcorrplot(corr_data_alpha$r, type = "upper", p.mat = corr_data_alpha$p, outline.color = "grey20", lab = TRUE, sig.level = 0.05) +
+        scale_fill_gradientn(colors =  RColorBrewer::brewer.pal(11, "Spectral") %>% rev,name = NULL) + theme_gray() +
+        theme(legend.position = c(0.8, 0.25), axis.title = element_blank()))
+
+## 群落结构变化模式：基于Bray-Curtis的PCoA分析和ANOISIM检验
+t_pcoa_comm <- trans_beta$new(dataset = dataset, measure = "bray", group = "Group")
+t_pcoa_comm$cal_ordination(ordination = "PCoA")
+t_pcoa_comm$res_ordination$scores$Group <- factor(t_pcoa_comm$res_ordination$scores$Group, levels = args$gap_order)
+(p_pcoa_comm <- t_pcoa_comm$plot_ordination(plot_color = "Group",
+                                            plot_shape = "Group", plot_type = c("chull", "point"),
+                                            point_size = 2, color_values = args$gap_color) +
+        theme(legend.position = c(0.86, 0.15)))
+t_pcoa_comm$cal_anosim(group = "Group", paired = TRUE)
+saveSingleXlsx(object = t_pcoa_comm$res_anosim, path = outdir_03,
+               filename = '群落-Bray-Curtis距离-ANOSIM检验.xlsx', row.names = F, col.names = T)
+
+## 群落结构变化模式：Bray-Curtis距离组间比较
+bet_comms <- trans_beta$new(dataset = dataset, group = "Group", measure = "bray")
+bet_comms$cal_group_distance(within_group = FALSE)
+dist_coms <- bet_comms$res_group_distance
+dist_coms <- dist_coms[which(dist_coms$Group != "GC vs GB"),]
+dist_coms$Group <- factor(dist_coms$Group, levels = c("GC vs CC", "GB vs CC"))
+compare_list <- list(c("GC vs CC", "GB vs CC"))
+(p_bet_coms <- ggplot(dist_coms, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("Bray-Curtis distance") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化模式：Bray-Curtis距离组内比较
+bet_comms_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "bray")
+bet_comms_wit$cal_group_distance(within_group = TRUE)
+dist_comms_wit <- bet_comms_wit$res_group_distance
+dist_comms_wit$Group <- factor(dist_comms_wit$Group, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_wit_coms <- ggplot(dist_comms_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("Bray-Curtis distance") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化的关键驱动因子: VPA分析
+beta_vpa <- vegan::varpart(t(dataset$otu_table) %>% vegan::decostand(method = "hellinger"),
+                           sol_table %>% vegan::decostand(method = "standardize"),
+                           pln_table[,args$pln_var[args$pln_var != 'DRR']] %>% vegan::decostand(method = "standardize"))
+plot(beta_vpa)
+beta_vpa_res <- as.data.frame(beta_vpa$part$indfract)
+beta_vpa_res <- data.frame(ID = rownames(beta_vpa_res), R.squared = beta_vpa_res$Adj.R.squared)
+beta_vpa_res$ID <- lapply(beta_vpa_res$ID, function(x){
+    x.str <- base::strsplit(x, split = ' =', fixed = T) %>% unlist
+    x.str[1]
+}) %>% unlist
+vpa_plot_dat <- beta_vpa_res[1:3,]
+vpa_plot_dat$ID[which(vpa_plot_dat$ID == '[a]')] <- "Soil"
+vpa_plot_dat$ID[which(vpa_plot_dat$ID == '[b]')] <- "Root"
+vpa_plot_dat$ID[which(vpa_plot_dat$ID == '[c]')] <- "Intersect"
+vpa_plot_dat <- vpa_plot_dat[order(vpa_plot_dat$R.squared, decreasing = T),]
+vpa_plot_dat$ID <- factor(vpa_plot_dat$ID, levels = as.character(vpa_plot_dat$ID))
+residuals <- beta_vpa_res[which(beta_vpa_res$ID == '[d]'),]$R.squared
+(p_beta_vpa <- ggplot(vpa_plot_dat, aes(x = ID, y = R.squared, fill = ID)) +
+        geom_bar(stat = 'identity', position = 'dodge') +
+        geom_text(aes(label = round(R.squared * 100, 2)), vjust = -0.5) +
+        geom_text(x = Inf, y = Inf, label = paste0('Residuals = ', round(residuals * 100, 2), '%'), vjust = 2, hjust = 1.2) +
+        scale_y_continuous(labels = function(x) x * 100) +
+        ylab("Explained variance (%)") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化的关键驱动因子: dbRDA分析
+rda_res <- trans_env$new(dataset = dataset,
+                         add_data = cbind(sol_table, pln_table[,args$pln_var[args$pln_var != 'DRR']]) %>% vegan::decostand(method = "standardize"))
+rda_res$cal_ordination(method = "dbRDA", use_measure = "bray")
+rda_res$trans_ordination(adjust_arrow_length = TRUE, max_perc_env = 1)
+rda_res$res_ordination_trans$df_sites$Group <- factor(rda_res$res_ordination_trans$df_sites$Group, levels = args$gap_order)
+(p_rda <- rda_res$plot_ordination(plot_color = "Group",
+                                  plot_shape = "Group", plot_type = c("chull", "point"),
+                                  point_size = 2, color_values = args$gap_color) + theme_gray() +
+        theme(legend.position = c(0.9, 0.83)))
+
+## 群落结构变化的关键驱动因子: envfit分析（需要先做上一步的dbRDA分析）找出dbRDA模型中R2大于0.6的参数
+## 结果表明，'ST', 'SWC', 'RMg', 'RCa'四个参数的R2大于0.6
+rda_res.envfit <- vegan::envfit(rda_res$res_ordination, rda_res$data_env)
+rda_res.envfit_df <- data.frame(Var = names(rda_res.envfit$vectors$r), R2 = rda_res.envfit$vectors$r)
+rda_res.envfit_df <- rda_res.envfit_df[order(rda_res.envfit_df$R2, decreasing = T),]
+rda_res.envfit_df$Var <- factor(rda_res.envfit_df$Var, levels = as.character(rda_res.envfit_df$Var))
+(p_envfit <- ggplot(rda_res.envfit_df, aes(x = Var, y = R2)) +
+        geom_bar(stat = 'identity', position = 'dodge', fill = 'white', color = 'black') +
+        geom_text(aes(label = round(R2, 2)), vjust = -0.5) +
+        ylab("R2 values") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化的关键驱动因子: 贡献率大于0.6的因子的欧式距离PCoA分析，验证其变化模式与群落变化模式是否相似
+envuse <- cbind(sol_table, pln_table[,args$pln_var[args$pln_var != 'DRR']]) %>% vegan::decostand(method = "standardize")
+sel_env_dist <- envuse[,c('ST', 'SWC', 'RMg', 'RCa')]%>% dist %>% as.matrix
+if (length(unique(rownames(dataset$sample_table) == rownames(sel_env_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(sel_env_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(sel_env_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(sel_env_dist))) stop("sample id order error!")
+dataset$beta_diversity$sel_env_dist <- sel_env_dist
+pcoa_env_new <- trans_beta$new(dataset = dataset, measure = "sel_env_dist", group = "Group")
+pcoa_env_new$cal_ordination(ordination = "PCoA")
+pcoa_env_new$res_ordination$scores$Group <- factor(pcoa_env_new$res_ordination$scores$Group, levels = args$gap_order)
+(p_pcoa_env_sels <- pcoa_env_new$plot_ordination(plot_color = "Group", plot_shape = "Group",
+                                                 plot_type = c("point", "chull"), point_size = 2, color_values = args$gap_color) +
+        theme(legend.position = c(0.35, 0.45)))
+pcoa_env_new$cal_anosim(group = "Group", paired = TRUE)
+saveSingleXlsx(object = pcoa_env_new$res_anosim, path = outdir_03,
+               filename = 'envift贡献大于0.6的环境参数-欧式距离-ANOSIM检验.xlsx', row.names = F, col.names = T)
+
+## 群落结构变化的关键驱动因子: 贡献率大于0.6的因子的欧式距离组间比较，验证其变化模式与群落变化模式是否相似
+bet_sel_env <- trans_beta$new(dataset = dataset, group = "Group", measure = "sel_env_dist")
+bet_sel_env$cal_group_distance(within_group = FALSE)
+dist_sel_env <- bet_sel_env$res_group_distance
+dist_sel_env <- dist_sel_env[which(dist_sel_env$Group != "GC vs GB"),]
+dist_sel_env$Group <- factor(dist_sel_env$Group, levels = c("GC vs CC", "GB vs CC"))
+compare_list <- list(c("GC vs CC", "GB vs CC"))
+(p_bet_sel_env <- ggplot(dist_sel_env, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("Euclidean distance") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化的关键驱动因子: 贡献率大于0.6的因子的欧式距离组内比较，验证其变化模式与群落变化模式是否相似
+bet_sel_env_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "sel_env_dist")
+bet_sel_env_wit$cal_group_distance(within_group = TRUE)
+dist_sel_env_wit <- bet_sel_env_wit$res_group_distance
+dist_sel_env_wit$Group <- factor(dist_sel_env_wit$Group, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_wit_sel_env <- ggplot(dist_sel_env_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("Euclidean distance") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落结构变化的关键驱动因子: bioenv分析 ==> ST 和RMg影响最大
+bioenv_res <- vegan::bioenv(t(dataset$otu_table),
+                            cbind(sol_table, pln_table[,args$pln_var[args$pln_var != 'DRR']]) %>% vegan::decostand(method = "standardize"),
+                            method = "spearman", parallel = 30, index = 'bray', metric = 'euclidean')
+bioenv_res_df <- summary(bioenv_res)
+bioenv_res_df <- data.frame(Index = bioenv_res_df$variables, R = bioenv_res_df$correlation)
+bioenv_res_df$Index <- lapply(bioenv_res_df$Index, function(x){
+    base::strsplit(x, split = ' ', fixed = T) %>% unlist %>% paste(collapse = ' + ')
+})%>% unlist
+bioenv_res_df <- bioenv_res_df[order(bioenv_res_df$R, decreasing = T),]
+bioenv_res_df$Index <- factor(bioenv_res_df$Index, levels = as.character(bioenv_res_df$Index) %>% rev)
+(p_bioenv <- ggplot(bioenv_res_df, aes(x = R, y = Index)) +
+        geom_bar(stat = 'identity', position = 'dodge', fill = 'white', color = 'black') +
+        geom_text(aes(label = round(R, 2)), vjust = 0.5, hjust = 1.2) +
+        xlab("Spearman correlation coefficient") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.y = element_blank()))
+
+## 群落结构变化的关键驱动因子: ST, SWC, RMg和RCa的欧式距离与群落Bray-Curtis距离的回归分析
+envuse <- cbind(sol_table, pln_table[,args$pln_var[args$pln_var != 'DRR']]) %>% vegan::decostand(method = "standardize")
+reg_dat.all <- data.frame(env = dist(envuse[,c("ST", "SWC", 'RMg', 'RCa')]) %>% as.vector(),
+                          bry = dataset$beta_diversity$bray %>% as.dist %>% as.vector)
+reg_dat.st <- data.frame(env = dist(envuse[,c("ST")]) %>% as.vector(),
+                         bry = dataset$beta_diversity$bray %>% as.dist %>% as.vector)
+reg_dat.swc <- data.frame(env = dist(envuse[,c("SWC")]) %>% as.vector(),
+                          bry = dataset$beta_diversity$bray %>% as.dist %>% as.vector)
+reg_dat.rmg <- data.frame(env = dist(envuse[,c("RMg")]) %>% as.vector(),
+                          bry = dataset$beta_diversity$bray %>% as.dist %>% as.vector)
+reg_dat.rca <- data.frame(env = dist(envuse[,c("RCa")]) %>% as.vector(),
+                          bry = dataset$beta_diversity$bray %>% as.dist %>% as.vector)
+(p_max_env_reg.all <- ggplot(reg_dat.all, aes(x = env, y = bry)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of ST, SWC, RMg and RCa") + ylab("Bray-Curtis distance of community") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+(p_max_env_reg.st <- ggplot(reg_dat.st, aes(x = env, y = bry)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of ST") + ylab("Bray-Curtis distance of community") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+(p_max_env_swc <- ggplot(reg_dat.swc, aes(x = env, y = bry)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of SWC") + ylab("Bray-Curtis distance of community") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+(p_max_env_rmg <- ggplot(reg_dat.rmg, aes(x = env, y = bry)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of RMg") + ylab("Bray-Curtis distance of community") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+(p_max_env_rca <- ggplot(reg_dat.rca, aes(x = env, y = bry)) +
+        geom_point(size = 3, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of RCa") + ylab("Bray-Curtis distance of community") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+
+## 群落组成柱状图
+compos_class <- trans_abund$new(dataset = dataset, taxrank = "Class", ntaxa = 89999998, groupmean = "Group") # 显示所有
+compos_class_color <- c("#1f78b4",  "#e31a1c", "#ff7f00", "#6a3d9a", "#a6cee3", "black", "#fb9a99", "#fdbf6f",
+                        "#cab2d6", "#ffff99", "green", "darkred", "#8da0cb", "#e78ac3", "#33a02c","#a6d854", "#ffd92f"
+                        , "blue","gray60","#20B2AA")
+compos_class$data_abund$Taxonomy[which(compos_class$data_abund$Taxonomy == 'unidentified')] <- "Unclassified"
+compos_class$data_abund <- compos_class$data_abund[order(compos_class$data_abund$Abundance, decreasing = T),]
+compos_class$data_abund$Sample <- factor(compos_class$data_abund$Sample, levels = args$gap_order)
+compos_display_order <- c(unique(as.character(compos_class$data_abund$Taxonomy))[unique(as.character(compos_class$data_abund$Taxonomy)) != 'Unclassified'],
+                          'Unclassified')
+compos_class$data_abund$Taxonomy <- factor(compos_class$data_abund$Taxonomy, levels = compos_display_order)
+(p_compos_class_level_all <- ggplot(compos_class$data_abund, aes(x = Sample, y = Abundance, fill = Taxonomy)) +
+        geom_bar(stat = 'identity', position = 'fill') + scale_fill_manual(name = 'Fungal class', values = compos_class_color) +
+        ylab("Relative abundance (%)") + guides(fill = guide_legend(ncol = 1)) + scale_y_continuous(labels = function(x) x * 100) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.title = element_text(size = 12),
+              legend.text = element_text(size = 10), legend.position = 'right', axis.title.x = element_blank()))
+
+## Class水平的差异分析
+compos_class_diff <- trans_diff$new(dataset = dataset, method = "lefse", group = "Group", alpha = 0.05,
+                                    lefse_subgroup = NULL, taxa_level = 'Class', p_adjust_method = 'none')
+(p_compos_class_level_diff <- compos_class_diff$plot_diff_bar(group_order = args$gap_order, keep_prefix = FALSE) + theme_gray() +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.title = element_blank(), legend.text = element_text(size = 10),
+              legend.position = 'right', axis.title.y = element_blank()))
+diff_abund_tab <- dataset$taxa_abund$Class[compos_class_diff$res_diff$Taxa,]
+diff_abund_tab <- data.frame(Taxa = rownames(diff_abund_tab), diff_abund_tab)
+diff_abund_tab$Taxa <- lapply(diff_abund_tab$Taxa, function(taxa){
+    ree <- base::strsplit(taxa, split = 'c__', fixed = T) %>% unlist
+    ree[2]
+})%>% unlist
+diff_abund_tab <- reshape2::melt(diff_abund_tab)
+diff_abund_tab$variable <- lapply(diff_abund_tab$variable, function(v){
+    dataset$sample_table[which(dataset$sample_table$SampleID == v),]$Group
+})%>% unlist
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+diff_abund_tab$variable <- factor(diff_abund_tab$variable, levels = args$gap_order)
+(p_compos_class_level_diff_abund_box <- ggplot(diff_abund_tab, aes(x = variable, y = value)) +
+        geom_boxplot(aes(fill = variable), outlier.size = 0.5) +
+        scale_y_continuous(labels = function(x) x * 100) +
+        ylab("Degradation rate of fine root (%)") + scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()) +
+        facet_wrap(~Taxa, scales = 'free_y', nrow = 1)) # 不准备在paper中使用
+
+## 真菌lifestyle功能预测
+fun_pre <- trans_func$new(dataset = dataset)
+fun_pre$cal_spe_func(fungi_database = "FungalTraits")
+fun_res <- fun_pre$res_spe_func_raw_FungalTraits
+fun_res$primary_lifestyle <- lapply(fun_res$primary_lifestyle, function(lifestyle){
+    stringr::str_replace_all(stringr::str_to_title(lifestyle), "_", " ")
+}) %>% unlist()
+fun_res <- fun_res[rownames(dataset$tax_table),]
+dataset$tax_table$Lifestyle <- fun_res$primary_lifestyle
+dataset$tax_table$Lifestyle[is.na(dataset$tax_table$Lifestyle )] <- "Unknown"
+dataset$tax_table$Type <- ifelse(grepl("saprotroph", dataset$tax_table$Lifestyle), 'Saprotrophs', dataset$tax_table$Lifestyle)
+dataset$tax_table$ASV <- rownames(dataset$tax_table) # 用于做差异分析
+dataset$tidy_dataset()
+dataset$cal_abund()
+
+## 现在ASV水平上做差异分析
+set.seed(123456)
+compos_class_diff <- trans_diff$new(dataset = dataset, method = "rf", group = "Group", alpha = 0.01,
+                                    lefse_subgroup = NULL, taxa_level = 'ASV', p_adjust_method = 'fdr')
+sig_asv_diff <- compos_class_diff$res_diff[which(compos_class_diff$res_diff$P.adj < 0.01),]
+sig_asv_data <- lapply(X = seq(nrow(sig_asv_diff)), function(x){
+    taxa <- sig_asv_diff[x,]$Taxa
+    p.adj <- sig_asv_diff[x,]$P.adj
+    taxa_split <- base::strsplit(taxa, split = '|', fixed = T) %>% unlist
+    asv <- taxa_split[length(taxa_split)]
+    class <- dataset$tax_table[which(dataset$tax_table$ASV == asv),]$Class
+    type <- dataset$tax_table[which(dataset$tax_table$ASV == asv),]$Type
+    lifestyle <- dataset$tax_table[which(dataset$tax_table$ASV == asv),]$Lifestyle
+    abund <- dataset$taxa_abund$ASV[taxa,]
+    data.frame(taxa = taxa, asv = asv, class = class, type = type, lifestyle = lifestyle, abund = abund)
+}) %>% do.call('rbind', .)
+part.colnames <- colnames(sig_asv_data)[6:length(colnames(sig_asv_data))]
+part.colnames_new <- lapply(part.colnames, function(part){
+    res <- base::strsplit(part, split = '.', fixed = T) %>% unlist
+    res[2]
+}) %>% unlist
+colnames(sig_asv_data)[6:length(colnames(sig_asv_data))] <- part.colnames_new
+sig_asv_df <- sig_asv_data %>% reshape2::melt()
+sig_asv_df$group <- lapply(sig_asv_df$variable, function(v){
+    dataset$sample_table[which(dataset$sample_table$SampleID == v),]$Group
+}) %>% unlist
+sig_asv_df <- sig_asv_df[which(sig_asv_df$type != 'Unknown'),]
+sig_asv_df$group <- factor(sig_asv_df$group, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+sap_dat <- sig_asv_df[which(sig_asv_df$type == 'Saprotrophs'),]
+sap_dat$class <- factor(sap_dat$class,
+                        levels = c("c__Sordariomycetes", "c__Eurotiomycetes", "c__Dothideomycetes",
+                                   "c__Geoglossomycetes", "c__Leotiomycetes"))
+(p_sap_diff <- ggplot(sap_dat, aes(x = group, y = value)) +
+        geom_boxplot(aes(fill = group)) +
+        scale_fill_manual(values = args$gap_color) +
+        ylab("Relative abundance (%)") +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        scale_y_continuous(labels = function(x) x * 100) +
+        facet_wrap(~class, scales = 'free_y', ncol = 1) +
+        theme(axis.title = element_text(size = 12),
+              axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()))
+(p_non_sap_diff <- ggplot(sig_asv_df[which(sig_asv_df$type != 'Saprotrophs'),], aes(x = group, y = value)) +
+        geom_boxplot(aes(fill = group)) +
+        scale_fill_manual(values = args$gap_color) +
+        ylab("Relative abundance (%)") +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        scale_y_continuous(labels = function(x) x * 100) +
+        facet_grid(type ~ class , scales = 'free') +
+        theme(axis.title = element_text(size = 12),
+              axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()))
+
+## 差异ASV生活型与环境参数和DRR的相关分析
+### 处理数据
+sig_asv_data_use <- sig_asv_data[which(sig_asv_data$type != 'Unknown'),]
+use_vec <- paste0(sig_asv_data_use$type, '|', sig_asv_data_use$class) %>% unique
+cor_dat <- lapply(use_vec, function(target){
+    target.split <- base::strsplit(target, split = '|', fixed = T) %>% unlist
+    type <- target.split[1]
+    class <- target.split[2]
+    abund <- sig_asv_data_use[which(sig_asv_data_use$type == type & sig_asv_data_use$class == class),]
+    abund <- abund[,6:ncol(abund)]
+    rownames(abund) <- seq(nrow(abund))
+    abund <- apply(abund, 2, mean)
+}) %>% do.call('rbind', .) %>% as.data.frame()
+rownames(cor_dat) <- use_vec
+cor_dat <- t(cor_dat)
+env_tabs <- data.frame(DRR = pln_table$DRR, sol_table, pln_table[,which(colnames(pln_table) != 'DRR')])
+cor_dat <- cor_dat[rownames(env_tabs),] %>% as.data.frame()
+
+### 与环境参数的相关分析
+corr_res_env <- psych::corr.test(env_tabs, cor_dat, method = 'spearman', adjust = 'fdr')
+(p_cor_env_diff_asv <- ggcorrplot(corr_res_env$r, type = "full", p.mat = corr_res_env$p,
+                                  outline.color = "grey20", lab = TRUE, sig.level = 0.05) +
+        scale_fill_gradientn(colors =  RColorBrewer::brewer.pal(11, "Spectral") %>% rev, name = NULL) + theme_gray() +
+        theme(legend.position = 'right', axis.title = element_blank()))
+
+## 合并和保存图
+### 多样性和群落结构差异合并图: 在宏观尺度上阐明多样性和群落组成在组建的变化趋势
+comm_sym_p_part.1 <- cowplot::plot_grid(p_alpha, p_veen, align = 'hv', ncol = 2, rel_widths = c(3,3), labels = c('A', 'B'))
+comm_sym_p_part.2 <- cowplot::plot_grid(p_pcoa_comm + theme(legend.title = element_blank()),
+                                        p_wit_coms, p_bet_coms, align = 'hv', ncol = 3, rel_widths = c(3,3,2), labels = c('C', 'D', 'E'))
+(comm_sym_p <- cowplot::plot_grid(comm_sym_p_part.1, comm_sym_p_part.2, nrow = 2, align = 'hv'))
+saved <- savePDF(object = comm_sym_p, path = outdir_03,
+                 filename = '多样性和群落组成在组建的变化趋势.pdf', width = 9.72, height = 8.81)
+
+### 群落组成和差异分析合并图: 在分类水平上阐明群落组成变化与DRR降解率变化的关系
+(comm_compos_p <- cowplot::plot_grid(p_compos_class_level_all + theme(legend.background = element_rect(colour = 'gray30')),
+                                     p_sap_diff, ncol = 2, rel_widths = c(5, 3), labels = c('A', 'B')))
+saved <- savePDF(object = comm_compos_p, path = outdir_03,
+                 filename = '纲水平群落组成及差异ASV对应的腐生生活型纲.pdf', width = 7.43, height = 9.64)
+saved <- savePDF(object = p_non_sap_diff, path = outdir_03,
+                 filename = '差异ASV对应的非腐生生活型纲.pdf', width = 4.54, height = 8.65)
+saved <- savePDF(object = p_cor_env_diff_asv, path = outdir_03,
+                 filename = '差异ASV生活型纲相关分析.pdf', width = 12.58, height = 9.64)
+
+### 多样性驱动因素热图
+saved <- savePDF(object = p_cor_alpha, path = outdir_03,
+                 filename = 'alpha多样性相关分析.pdf', width = 7.61, height = 7.61)
+
+### 群落结构差异驱动因素合并图：第一个
+comm_fac_p_part.1.1 <- cowplot::plot_grid(p_rda + scale_y_continuous(labels = function(x) format(x, nsmall = 1)),
+                                          p_envfit, ncol = 2, rel_widths = c(2,3), labels = c('A', 'B'), align = 'hv')
+comm_fac_p_part.1.2 <- cowplot::plot_grid(p_pcoa_env_sels, p_wit_sel_env, p_bet_sel_env, align = 'hv', ncol = 3,
+                                          rel_widths = c(3,3,2), labels = c('C', 'D', 'E'))
+(comm_fac_p_part.1 <- cowplot::plot_grid(comm_fac_p_part.1.1, comm_fac_p_part.1.2, nrow = 2, align = 'hv'))
+saved <- savePDF(object = comm_fac_p_part.1, path = outdir_03,
+                 filename = '群落结构差异驱动因素合并图1.pdf', width = 12.34, height = 9.64)
+
+### bioenv结果
+saved <- savePDF(object = p_bioenv, path = outdir_03, filename = 'bioenv结果.pdf', width = 12.34, height = 4.31)
+
+### 群落结构差异驱动因素合并图：第二个
+comm_fac_p_part.2.1 <- cowplot::plot_grid(p_beta_vpa, p_max_env_reg.all, p_max_env_reg.st, ncol = 3,
+                                          rel_widths = c(2, 3, 3), labels = c('A', 'B'), align = 'hv')
+comm_fac_p_part.2.2 <- cowplot::plot_grid(p_max_env_swc, p_max_env_rmg, p_max_env_rca, ncol = 3,
+                                          rel_widths = c(3, 3, 3), labels = c('C', 'D'), align = 'hv')
+(comm_fac_p_part.2 <- cowplot::plot_grid(comm_fac_p_part.2.1, comm_fac_p_part.2.2, nrow = 2, align = 'hv'))
+saved <- savePDF(object = comm_fac_p_part.2, path = outdir_03,
+                 filename = '群落结构差异驱动因素合并图2.pdf', width = 12.34, height = 9.64)
+
+# 4. 群落构建机制及其关键驱动因素分析
+outdir_04 <- createDir(rootPath = '.', dir = "results/04.com-asb")
+
+## 计算null模型
+outfile_name <- file.path(outdir_04, paste0('results-null-model-fungi.Rds'))
+if (!file.exists(outfile_name)){
+    tmp.path.sesmntd <- createDir(rootPath = outdir_04, dir = 'ses.mntd')
+    phylo.dist <- iCAMP::pdist.big(tree = dataset$phylo_tree, wd = tmp.path.sesmntd,
+                                   tree.asbig = FALSE, output = TRUE, nworker = 100, nworker.pd = 100, memory.G = 100)
+    asv.order <- rownames(dataset$otu_table)
+    asv.idx <- sapply(asv.order, function(x){which(rownames(phylo.dist) == x)})
+    phylo.dist.sig <- as.matrix(phylo.dist[asv.idx, asv.idx])
+    if (length(unique(asv.order == rownames(phylo.dist.sig))) > 1 ||
+        !unique(asv.order == rownames(phylo.dist.sig))){
+        stop("ASV IDs in ASV table can not match to those in phylogenetic distance matrix!")
+    }
+    if (length(unique(asv.order == colnames(phylo.dist.sig))) > 1 ||
+        !unique(asv.order == colnames(phylo.dist.sig))){
+        stop("ASV IDs in ASV table can not match to those in phylogenetic distance matrix!")
+    }
+    sesMNTD <- picante::ses.mntd(samp = t(dataset$otu_table), dis = phylo.dist.sig,
+                                 null.model = "taxa.labels", abundance.weighted = TRUE,
+                                 runs = 999) %>% suppressMessages() %>% suppressWarnings()
+    tmp.path.bnti <- createDir(rootPath = outdir_04, dir = 'bnti_fun')
+    betaNTI <- iCAMP::qpen(comm = t(dataset$otu_table), tree = dataset$phylo_tree, ab.weight = TRUE,
+                           rand.time = 999, sig.bNTI = 2, sig.rc = 0.95, nworker = 100, memory.G = 100,
+                           project = 'bnti-forest-fun',wd = tmp.path.bnti, output.detail = TRUE)
+    null_res <- list(sesmntd = sesMNTD, bnti = betaNTI)
+    saveRDS(object = null_res, file = outfile_name)
+}else{
+    null_res <- readRDS(outfile_name)
+}
+
+## sesMNTD分布模式: 箱线图
+alpha.null.dat <- data.frame(row.names = rownames(null_res$sesmntd), ses.mntd = null_res$sesmntd$mntd.obs.z, mntd = null_res$sesmntd$mntd.obs)
+alpha.null.dat <- alpha.null.dat[rownames(dataset$sample_table),]
+alpha.null.dat.df <- cbind(alpha.null.dat, dataset$sample_table) %>% reshape2::melt()
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_ses.mntd <- ggplot(alpha.null.dat.df[which(alpha.null.dat.df$variable == 'ses.mntd'),], aes(x = Group, y = value)) + geom_boxplot(aes(fill = Group), outlier.size = 0.5) +
+        ylab("ses.MNTD") + scale_fill_manual(values = args$gap_color) +
+        geom_hline(yintercept = 1, color = 'blue', linetype = 2) +
+        ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              strip.text = element_text(size = 12), axis.title.x = element_blank()))
+
+## sesMNTD变化的关键驱动因子：Spearman相关分析
+sol_tab_with_ses.mntd <- data.frame(ses.MNTD = alpha.null.dat$ses.mntd, sol_table, pln_table[,which(colnames(pln_table) != 'DRR')])
+corr_data_ses.mntd <- psych::corr.test(sol_tab_with_ses.mntd, method = 'spearman')
+(p_cor_ses.mntd <- ggcorrplot(corr_data_ses.mntd$r, type = "upper", p.mat = corr_data_ses.mntd$p, outline.color = "grey20", lab = TRUE, sig.level = 0.05) +
+        scale_fill_gradientn(colors =  RColorBrewer::brewer.pal(11, "Spectral") %>% rev,name = NULL) + theme_gray() +
+        theme(legend.position = c(0.8, 0.25), axis.title = element_blank()))
+
+## 将beta.NTI加入dataset
+null_obj <- null_res$bnti$result
+nti <- parallel::mclapply(X = dataset$sample_table$SampleID, mc.cores = 100, FUN = function(sample1){
+    tmp.res <- lapply(X = dataset$sample_table$SampleID, function(sample2){
+        if (sample2 == sample1) {
+            bnti <- NA
+        }else{
+            bnti <- null_obj[which(null_obj$sample1 == sample1 & null_obj$sample2 == sample2),]$bNTI
+            if (length(bnti) == 0) {
+                bnti <- null_obj[which(null_obj$sample1 == sample2 & null_obj$sample2 == sample1),]$bNTI
+            }
+        }
+        bnti
+    }) %>% unlist()
+    tmp.res.df <- data.frame(row.names = dataset$sample_table$SampleID, nti = tmp.res) %>% t()
+    rownames(tmp.res.df) <- sample1
+    tmp.res.df
+}) %>% do.call("rbind", .) %>% as.matrix() %>% round(digits = 6)
+dataset$beta_diversity$bNTI <- nti
+
+## 群落构建变化模式：bNTI距离组间比较
+bet_nti <- trans_beta$new(dataset = dataset, group = "Group", measure = "bNTI")
+bet_nti$cal_group_distance(within_group = FALSE)
+dist_nti <- bet_nti$res_group_distance
+dist_nti <- dist_nti[which(dist_nti$Group != "GC vs GB"),]
+dist_nti$Group <- factor(dist_nti$Group, levels = c("GC vs CC", "GB vs CC"))
+(p_bet_nti <- ggplot(dist_nti, aes(x = Group, y = Value)) +
+        geom_boxplot(fill = 'white', outlier.size = 0.5) + ylab("bNTI") +
+        geom_hline(yintercept = 2, color = 'blue', linetype = 2) +
+        geom_hline(yintercept = -2, color = 'blue', linetype = 2) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.format", hide.ns = TRUE, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 群落构建变化模式：bNTI距离组内比较
+bet_nti_wit <- trans_beta$new(dataset = dataset, group = "Group", measure = "bNTI")
+bet_nti_wit$cal_group_distance(within_group = TRUE)
+dist_nti_wit <- bet_nti_wit$res_group_distance
+dist_nti_wit$Group <- factor(dist_nti_wit$Group, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+(p_wit_nti <- ggplot(dist_nti_wit, aes(x = Group, y = Value)) +
+        geom_boxplot(aes(fill = Group), outlier.size = 0.5) + ylab("bNTI") +
+        geom_hline(yintercept = 2, color = 'blue', linetype = 2) +
+        geom_hline(yintercept = -2, color = 'blue', linetype = 2) +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.format",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## bNTI变化的关键驱动因子
+bNTI_vec <- dataset$beta_diversity$bNTI %>% as.dist %>% as.vector
+env_use_dat <- cbind(sol_table, pln_table[,which(colnames(pln_table) != 'DRR')]) %>% vegan::decostand(method = "standardize")
+envs_dfs <- lapply(X = seq(ncol(env_use_dat)), function(x){
+    dist(env_use_dat[,x]) %>% as.vector
+}) %>% do.call('cbind', .) %>% as.data.frame
+colnames(envs_dfs) <- colnames(env_use_dat)
+envs_dfs_with_nti <- data.frame(bNTI = bNTI_vec, envs_dfs)
+corr_data_nti <- psych::corr.test(envs_dfs_with_nti, method = 'spearman', adjust = 'none')
+(p_cor_nti <- ggcorrplot(corr_data_nti$r, type = "upper", p.mat = corr_data_nti$p, outline.color = "grey20", lab = TRUE, sig.level = 0.05) +
+        scale_fill_gradientn(colors =  RColorBrewer::brewer.pal(11, "Spectral") %>% rev,name = NULL) + theme_gray() +
+        theme(legend.position = c(0.8, 0.25), axis.title = element_blank()))
+(p_max_reg_nti <- ggplot(envs_dfs_with_nti, aes(x = RCa, y = bNTI)) +
+        geom_point(size = 2.5, shape = 21, fill = 'white', color = 'gray20', alpha = 0.7) +
+        geom_hline(yintercept = 2, color = 'blue', linetype = 2) +
+        geom_hline(yintercept = -2, color = 'blue', linetype = 2) +
+        geom_smooth(method = "lm", formula = y ~ x, se = T) +
+        ggpubr::stat_cor(method = 'spearman') +
+        xlab("Euclidean distance of bNTI") + ylab("bNTI") +
+        theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12)))
+
+## 绘制组内生态过程图
+grodat.use <- dataset$sample_table
+group <- grodat.use$Group %>% unique %>% as.character()
+nullRst <- null_res$bnti$result
+bMNTD <- bNTI <- EP <- NULL
+for (i in seq(length(group))){
+    tmpGroup <- group[i]
+    tmpSamples <- grodat.use[which(grodat.use$Group == tmpGroup),]$SampleID
+    tmpNullObject <- nullRst[which(nullRst$sample1 %in% tmpSamples & nullRst$sample2 %in% tmpSamples),]
+    tmpProcessRaw <- as.data.frame(table(tmpNullObject$process))
+    tmpProcess <- data.frame(Process = tmpProcessRaw$Var1,
+                             Freq = tmpProcessRaw$Freq,
+                             Group = rep(tmpGroup, nrow(tmpProcessRaw)))
+    EP <- rbind(EP, tmpProcess)
+}
+all_processes <- c("Heterogeneous.Selections", "Dispersal.Limitation", "Homogeneous.Selection", "Homogenizing.Dispersal", "Undominated")
+for (pro in all_processes){
+    if (!pro %in% EP$Process){
+        EP <- rbind(EP, data.frame(Process = pro, Freq = 0, Group = "GC"))
+    }
+}
+EP$Process <- factor(EP$Process, levels = all_processes)
+EP$Group <- factor(EP$Group, levels = args$gap_order)
+(p_EP_wit <- ggplot(EP, aes(x = Group, y = Freq, fill = Process)) +
+        geom_bar(stat = 'identity', position = 'fill') + scale_y_continuous(labels = function(x) x * 100) +
+        ylab("Contribution of assembling processes (%)") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position ='right', axis.title.x = element_blank()))
+
+## 绘制组间的生态过程图
+grodat.use <- dataset$sample_table
+group <- grodat.use$Group %>% unique %>% as.character()
+process <- null_res$bnti$result[,c('sample1', 'sample2', 'process')]
+gap_list <- list(c("GB", "CC"), c("GC", "CC"))
+ep_bet_rst <- lapply(gap_list, function(gap_vec){
+    samples_1 <- dataset$sample_table[which(dataset$sample_table$Group == gap_vec[1]),]$SampleID %>% as.character()
+    samples_2 <- dataset$sample_table[which(dataset$sample_table$Group == gap_vec[2]),]$SampleID %>% as.character()
+    process_tmp <- NULL
+    for (i in seq(nrow(process))){
+        sample1 <- process[i,]$sample1
+        sample2 <- process[i,]$sample2
+        if ((sample1 %in% samples_1 & sample2 %in% samples_2) | (sample2 %in% samples_1 & sample1 %in% samples_2)){
+            process_tmp <- rbind(process_tmp, process[i,])
+        }
+    }
+    process_tmp <- as.data.frame(table(process_tmp$process))
+    process_tmp$Group <- rep(paste(gap_vec, collapse = ' vs. '), nrow(process_tmp))
+    process_tmp
+}) %>% do.call('rbind', .)
+all_processes <- c("Heterogeneous.Selections", "Dispersal.Limitation", "Homogeneous.Selection", "Homogenizing.Dispersal", "Undominated")
+for (pro in all_processes){
+    if (!pro %in% ep_bet_rst$Var1){
+        ep_bet_rst <- rbind(ep_bet_rst, data.frame(Var1 = pro, Freq = 0, Group = 'GB vs. CC'))
+    }
+}
+ep_bet_rst$Var1 <- factor(ep_bet_rst$Var1, levels = all_processes)
+ep_bet_rst$Group <- factor(ep_bet_rst$Group, levels = c('GC vs. CC', 'GB vs. CC'))
+(p_EP_bet <- ggplot(ep_bet_rst, aes(x = Group, y = Freq, fill = Var1)) +
+        geom_bar(stat = 'identity', position = 'fill') + scale_y_continuous(labels = function(x) x * 100) +
+        ylab("Contribution of assembling processes (%)") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position ='right', axis.title.x = element_blank()))
+
+## 计算周转和嵌套 (https://www.jianshu.com/p/fdd1607a09a1)
+# 加载包并使用beta.div.comp函数进行计算
+gros <- dataset$sample_table
+otus <- dataset$otu_table %>% t()
+gaps <- list(c("CC", "CC"), c("GC", "GC"), c("GB", "GB"), c("GB", "GC"), c("GB", "CC"), c("GC", "CC"))
+comp_rst <- lapply(gaps, function(gap){
+
+    # 计算
+    library(adespatial)
+    library(reshape2)
+    samples <- gros[which(gros$Group %in% gap),]$SampleID
+    otu <- otus[samples,]; otu <- otu[,apply(otu, 2, sum) > 0]
+    gro <- gros[samples,]
+    data = otu
+    out1 <- beta.div.comp(data, coef ='J', quant = FALSE) # Jaccard
+
+    # 样本对之间的相异指数计算
+    D <- as.matrix(out1$D)
+    diag(D) <- "NA"
+    D[upper.tri(D)] <- "NA"
+    D1=melt(D)
+    D1=subset(D1,!D1$value=="NA")
+
+    # 样本对之间的物种替换（repl）
+    repl <- as.matrix(out1$repl)
+    diag(repl) <- "NA"
+    repl[upper.tri(repl)] <- "NA"
+    repl1=melt(repl)
+    repl1=subset(repl1,!repl1$value=="NA")
+
+    # 样本对之间的丰富度差异（nest）
+    nest <- as.matrix(out1$rich)
+    diag(nest) <- "NA"
+    nest[upper.tri(nest)] <- "NA"
+    nest1=melt(nest)
+    nest1=subset(nest1,!nest1$value=="NA")
+
+    # 合并数据nest-repl至data.frame：
+    dff = merge(D1,repl1,by=c("Var1","Var2"))
+    dff = merge(dff,nest1,by=c("Var1","Var2"))
+    colnames(dff)=c("site1","site2","D","repl","nest")
+    dff$group <- lapply(X = seq(nrow(dff)), function(x){
+        site1 <- dff[x,]$site1
+        site2 <- dff[x,]$site2
+        paste0(dataset$sample_table[which(dataset$sample_table$SampleID == site1),]$Group,
+               ' vs. ',
+               dataset$sample_table[which(dataset$sample_table$SampleID == site2),]$Group)
+    }) %>% unlist()
+
+    ## 处理绘图数据
+    dff$D <- as.numeric(dff$D)
+    dff$repl <- as.numeric(dff$repl)
+    dff$nest <- as.numeric(dff$nest)
+    dff$repl.ratio <- dff$repl/dff$D
+    dff$nest.ratio <- dff$nest/dff$D
+    dff$type <- lapply(X = nrow(dff), function(x){
+        repl.ratio <- dff[x,]$repl.ratio
+        nest.ratio <- dff[x,]$nest.ratio
+        if (repl.ratio > 0.5 & repl.ratio > nest.ratio){
+            tag <- "Turnover"
+        }else if(nest.ratio > 0.5 & nest.ratio > repl.ratio){
+            tag <- "Nest"
+        }else{
+            tag <- "UD"
+        }
+        tag
+    }) %>% unlist()
+    dff
+}) %>% do.call('rbind', .)
+
+## 绘制组内的周转和嵌套图
+comp_rst_wit <- comp_rst[which(comp_rst$group %in% c('CC vs. CC', "GC vs. GC", "GB vs. GB")),]
+compare_list <- list(c('CC vs. CC', "GC vs. GC"), c("CC vs. CC", "GB vs. GB"), c('GC vs. GC', 'GB vs. GB'))
+comp_rst_wit$group <- factor(comp_rst_wit$group, levels = c('CC vs. CC', "GC vs. GC", "GB vs. GB"))
+(p_wit_repl <- ggplot(comp_rst_wit, aes(x = group, y = repl.ratio)) +
+        geom_boxplot(aes(fill = group), outlier.size = 0.5) + ylab("bNTI") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_wit_nest <- ggplot(comp_rst_wit, aes(x = group, y = nest.ratio)) +
+        geom_boxplot(aes(fill = group), outlier.size = 0.5) + ylab("bNTI") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, comparisons = compare_list, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 绘制组间的周转和嵌套图
+comp_rst_bet <- comp_rst[which(comp_rst$group %in% c("CC vs. GC", "CC vs. GB")),]
+comp_rst_bet$group <- factor(comp_rst_bet$group, levels = c("CC vs. GC", "CC vs. GB"))
+(p_bet_repl <- ggplot(comp_rst_bet, aes(x = group, y = repl.ratio)) +
+        geom_boxplot(fill= 'white', outlier.size = 0.5) + ylab("bNTI") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+(p_bet_nest <- ggplot(comp_rst_bet, aes(x = group, y = nest.ratio)) +
+        geom_boxplot(fill= 'white', outlier.size = 0.5) + ylab("bNTI") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', label = "p.signif",
+                                   hide.ns = TRUE, size = 4) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = 'none',
+              axis.title.x = element_blank()))
+
+## 合并图
+## 第一张
+asmb.part1 <- cowplot::plot_grid(p_ses.mntd, p_wit_nti, p_bet_nti, ncol = 3, rel_widths = c(3,3,1.5), labels = c('A', 'B', 'C'), align = 'hv')
+asmb.part2 <- cowplot::plot_grid(p_max_reg_nti,
+                    p_EP_wit + theme(legend.position = 'none'),
+                   p_EP_bet + theme(legend.position = 'none'), ncol = 3, rel_widths = c(3,3,2.2), labels = c('D', 'E', 'F'), align = 'hv')
+asmb.part3 <- cowplot::plot_grid(p_wit_repl, p_bet_repl, ncol = 2, rel_widths = c(3,3), labels = c('G', 'H'), align = 'hv')
+(assmeb1 <- cowplot::plot_grid(asmb.part1, asmb.part2, asmb.part3, ncol = 1, align = 'hv'))
+saved <- savePDF(object = assmeb1, path = outdir_04, filename = '群落构建过程.pdf', width = 9.59, height = 11.64)
+
+
+## 第二和三张
+save <- savePDF(object = p_cor_ses.mntd, path = outdir_04, filename = 'sesMNTD相关分析.pdf', width = 9.59, height = 9.59)
+save <- savePDF(object = p_cor_nti, path = outdir_04, filename = 'bNTI相关分析.pdf', width = 9.59, height = 9.59)
+
+## 第三张: 嵌套图
+(assmeb2 <- cowplot::plot_grid(p_wit_nest, p_bet_nest, ncol = 2, align = 'hv', labels = c("A", "B"), rel_widths = c(3, 2.2)))
+saved <- savePDF(object = assmeb2, path = outdir_04, filename = 'nest图.pdf', width = 9.59, height = 5.07)

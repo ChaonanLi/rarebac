@@ -1,0 +1,713 @@
+# 0. Load R packages and required functions in this workflow
+require(magrittr)
+require(microeco)
+require(ggplot2)
+source('utils.r')
+source('vector-test.r')
+
+# 1. Read 
+
+
+
+# 1. 读取原始数据
+## 创建结果目录
+outdir_01 <- "results/01.read-files"
+if (!outdir_01 %>% dir.exists) dir.create(outdir_01, recursive = T)
+
+## 读取进化树
+tre_table <- ape::read.tree("../../汶马高速/汶马高速野外数据/汶马高速16s/tree.nwk")
+
+## 读取KEGG拷贝数
+kegg_copies <- data.table::fread("../../汶马高速/汶马高速野外数据/汶马高速16s/10_picrust2/KO_predicted.tsv", sep = '\t', header = T, nThread = 5) %>% as.data.frame()
+rownames(kegg_copies) <- kegg_copies$sequence; kegg_copies <- kegg_copies[,-1]
+
+## 读取分组表
+gro_table <- xlsx::read.xlsx("../../汶马高速/汶马高速野外数据/环境和分组表/metadata.xlsx", sheetIndex = 2, as.data.frame = T)
+rownames(gro_table) <- gro_table$ID
+gro_table <- gro_table[which(gro_table$Elevation %in% c(2900, 3102, 3194)),]
+gro_table$Elevation <- as.character(gro_table$Elevation)
+
+## 读取OTU丰度表
+otu_table <- read.table("../../汶马高速/汶马高速野外数据/汶马高速16s/feature-table.tsv", header = T, sep = '\t', comment.char = "", skip = 1)
+rownames(otu_table) <- otu_table$X.OTU.ID
+otu_table <- otu_table[,-1] 
+otu_table <- t(otu_table)
+
+## 计算可用样本: 取分组表和otu表中样本编号交集，共30个样本可用
+sampleIDs <- intersect(gro_table %>% rownames, otu_table %>% rownames)
+sampleIDs %>% length
+
+## 剔除分组表和OTU丰度表中不要的样本
+gro_table <- gro_table[sampleIDs,]
+otu_table <- otu_table[sampleIDs,]
+otu_table <- otu_table[,apply(otu_table, 2, sum) > 0]
+gro_table %>% dim # 30 * 4
+otu_table %>% dim # 30 * 8916
+
+## 读取环境参数表
+met_table <- xlsx::read.xlsx("../../汶马高速/汶马高速野外数据/环境和分组表/metadata.xlsx", sheetIndex = 1, as.data.frame = T)
+rownames(met_table) <- met_table$ID; met_table <- met_table[,4:ncol(met_table)]
+use_env_vars <- c("pH", "MC", "ST","CD","TOC", "TN", "TP", "NO", "NH","AP")
+met_table <- met_table[sampleIDs, use_env_vars]
+
+## 读取物种分类信息表
+tax_table <- data.table::fread("../../汶马高速/汶马高速野外数据/汶马高速16s/taxonomy.tsv", sep = '\t') %>% as.data.frame
+rownames(tax_table) <- tax_table$`Feature ID`
+tax_table <- tax_table[colnames(otu_table),]
+
+## 处理物种分类信息表
+tax_rst <- lapply(X = tax_table %>% nrow %>% seq, function(x){
+    tax_res <- tax_table$Taxon[x] %>% strsplit(., split = ";", fixed = T) %>% unlist
+    if (tax_res %>% length < 7) tax_res <- c(tax_res, rep(NA, 7 - length(tax_res)))
+    tax_res %<>% as.data.frame %>% t
+    colnames(tax_res) <- c('Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')
+    rownames(tax_res) <- rownames(tax_table)[x]
+    tax_res[1,] <- lapply(tax_res[1,], function(col) gsub("^D_\\d+__", "", col)) %>% unlist
+    tax_res
+}) %>% do.call('rbind', .)
+tax_table <- cbind(tax_table, tax_rst)
+tax_table <- tax_table[,-c(1, 2, 3)]
+
+## 检查样本和OTU编号顺序：以`gro_table`中的样本顺序为标准；以`otu_table`中的ASV编号顺序为标准
+if (length(unique(rownames(otu_table) == rownames(gro_table))) > 1 || !unique(rownames(otu_table) == rownames(gro_table))){
+    stop("sample order error!") 
+}
+if (length(unique(rownames(met_table) == rownames(gro_table))) > 1 || !unique(rownames(met_table) == rownames(gro_table))){
+    stop("sample order error!") 
+}
+if (length(unique(rownames(tax_table) == colnames(otu_table))) > 1 || !unique(rownames(tax_table) == colnames(otu_table))){
+    stop("asv order error!") 
+}
+
+## 设置颜色和顺序
+args <- list(
+    taxa_type_full_order = c('all', 'abundant','rare', 'hyper_rare'),
+    taxa_type_part_order = c('abundant','rare', 'hyper_rare'),
+    elev_order = c('2900','3102', '3194'),
+    slop_order = c('NS','CS'),
+    taxa_type_full_color = RColorBrewer::brewer.pal(9, "Set1")[c(4,3,2,1)],
+    taxa_type_part_color = RColorBrewer::brewer.pal(9, "Set1")[c(3,2,1)],
+    elev_color = RColorBrewer::brewer.pal(8, "Dark2")[1:3],
+    slop_color = RColorBrewer::brewer.pal(8, "Accent")[1:2]
+)
+
+## 将整理好的数据保存到磁盘
+raw_data = list(otu = otu_table, tax = tax_table, gro = gro_table, met = met_table, tre = tre_table, cop = kegg_copies, args = args) 
+saveRDS(object = raw_data, file = file.path(outdir_01, "raw_16SrRNA_dataset.Rds"))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 2. 拆分原始数据
+## 创建结果目录
+outdir_02 <- "results/02.split-data"
+if (!outdir_02 %>% dir.exists) dir.create(outdir_02, recursive = T)
+
+## 将OTU表拆分为: 极稀有、稀有和高丰度三个类别
+otu_table_trans <- otu_table %>% t
+otu_table_trans <- (otu_table_trans/sum(otu_table_trans)) * 100 # 相对丰度百分比
+mean_r_abund <- lapply(X = otu_table_trans %>% nrow %>% seq, function(x) otu_table_trans[x,] %>% mean) %>% unlist() # 相对丰度百分比均值
+mean_r_abund_df <- data.frame(OTUID = rownames(otu_table_trans), abund_perct = mean_r_abund)
+mean_r_abund_df$type <- cut(mean_r_abund_df$abund_perct, breaks=c(-Inf, 0.0001, 0.001, Inf), label=c("hyper_rare", "rare", "abundant")) 
+type_count_table <- table(mean_r_abund_df$type) %>% as.data.frame
+otu_tables <- list(hyper_rare = otu_table[,mean_r_abund_df[which(mean_r_abund_df$type == 'hyper_rare'),]$OTUID], 
+                   rare = otu_table[,mean_r_abund_df[which(mean_r_abund_df$type == 'rare'),]$OTUID], 
+                   abundant = otu_table[,mean_r_abund_df[which(mean_r_abund_df$type == 'abundant'),]$OTUID], 
+                   all = otu_table)
+saveRDS(object = otu_tables, file = file.path(outdir_02, "ranked_otu_tables.Rds"))
+
+## 计算不同优势类群在样本中的分布情况
+otu_occupies <- lapply(X = otu_tables %>% length %>% seq, function(x){
+    otu_tab_abu <- otu_tables[[x]] %>% t
+    otu_tab_bin <- otu_tables[[x]] %>% t
+    otu_tab_bin[otu_tab_bin > 0] <- 1
+    otu_nam <- names(otu_tables)[x]
+    occupies <- rowSums(otu_tab_bin) %>% as.data.frame
+    reads_numbers <- rowSums(otu_tab_abu) %>% as.data.frame
+    dat <- data.frame(otu = rownames(occupies), occupies = occupies, reads_numbers = reads_numbers, type <- rep(otu_nam, nrow(occupies)))
+    colnames(dat) <- c("otu", "occupies", "reads_numbers", "type")
+    dat
+}) %>% do.call('rbind', .)
+
+## 绘制不同优势类群在样本中的分布情况
+otu_occupies$type <- factor(otu_occupies$type, levels = args$taxa_type_part_order)
+type_count_table$Var1 <- factor(type_count_table$Var1, levels = args$taxa_type_part_order)
+mean_r_abund_df$type <- factor(mean_r_abund_df$type, levels = args$taxa_type_part_order)
+p1.1 <- ggplot(otu_occupies[which(otu_occupies$type != 'all'),], aes(x = occupies, y = log2(reads_numbers))) + 
+    geom_point(aes(fill = type, color = type, size = reads_numbers), shape = 21,  alpha = 0.7) + 
+    theme_bw() + xlab("Occupied sites") + ylab("log2(read number)") + 
+    scale_fill_manual(values = args$taxa_type_part_color) + 
+    scale_color_manual(values = args$taxa_type_part_color) + 
+    theme(legend.position = 'none', axis.title = element_text(size = 12), axis.text = element_text(size = 10)) 
+min(otu_occupies[which(otu_occupies$type == 'hyper_rare'),]$occupies)
+max(otu_occupies[which(otu_occupies$type == 'hyper_rare'),]$occupies)
+min(otu_occupies[which(otu_occupies$type == 'rare'),]$occupies)
+max(otu_occupies[which(otu_occupies$type == 'rare'),]$occupies)
+min(otu_occupies[which(otu_occupies$type == 'abundant'),]$occupies)
+max(otu_occupies[which(otu_occupies$type == 'abundant'),]$occupies)
+min(mean_r_abund_df[which(mean_r_abund_df$type == 'hyper_rare'),]$abund_perct)
+max(mean_r_abund_df[which(mean_r_abund_df$type == 'hyper_rare'),]$abund_perct)
+min(mean_r_abund_df[which(mean_r_abund_df$type == 'rare'),]$abund_perct)
+max(mean_r_abund_df[which(mean_r_abund_df$type == 'rare'),]$abund_perct)
+min(mean_r_abund_df[which(mean_r_abund_df$type == 'abundant'),]$abund_perct)
+max(mean_r_abund_df[which(mean_r_abund_df$type == 'abundant'),]$abund_perct)
+p1.2 <- ggplot(type_count_table, aes(x = Freq, y = Var1)) + 
+    geom_bar(stat = 'identity', position = 'dodge', aes(fill = Var1)) +
+    geom_text(aes(label = Freq), hjust = 1, size = 3) + 
+    scale_fill_manual(values = args$taxa_type_part_color) + 
+    theme(legend.position = 'none', axis.line = element_blank(), axis.text.x = element_blank(), 
+          axis.title = element_blank(), axis.text.y = element_text(size = 10), axis.ticks.x = element_blank())
+p1 <- p1.1 + annotation_custom(ggplotGrob(p1.2), xmin = 6, xmax = 31.86, ymin = -0.85, ymax = 2.4)
+p2.1 <- ggplot(mean_r_abund_df, aes(x = type, y = abund_perct)) + 
+    geom_boxplot(aes(fill = type), outlier.shape = NA)  + 
+    geom_hline(yintercept = 0.0001, linetype = 2, color = "gray50") + 
+    geom_hline(yintercept = 0.001, linetype = 2, color = "gray50") + 
+    scale_fill_manual(values = args$taxa_type_part_color) + 
+    ylim(0, 0.004) + theme_bw() + xlab("ASV type") + ylab("Average relative abundance (%)") + 
+    theme(legend.position = 'none', axis.title = element_text(size = 12), axis.text = element_text(size = 10))
+p2.2 <- ggplot(mean_r_abund_df, aes(x = type, y = abund_perct)) + 
+    geom_boxplot(aes(fill = type), outlier.size = 0.5) +
+    xlab("ASV type") + ylab("Average relative abundance (%)") + 
+    scale_fill_manual(values = args$taxa_type_part_color) + 
+    theme(legend.position = 'none', axis.title = element_text(size = 10), axis.text = element_text(size = 8), axis.title.x = element_blank())
+p2 <- p2.1 + annotation_custom(ggplotGrob(p2.2), xmin = 1.5, xmax = 3.635, ymin = 0.0015, ymax = 0.00425)
+(p_asv_distri <- cowplot::plot_grid(p1, p2, nrow = 1, labels = c("A", "B"), label_size = 18))
+saved <- savePDF(object = p_asv_distri, path = outdir_02, filename = "不同优势类群在样本中的分布情况.pdf", width = 7.56, height = 5.08)
+
+## 构建不同类型ASV的数据集
+datasets <- lapply(otu_tables, function(tab){
+    dataset <- microtable$new(otu_table = t(tab) %>% as.data.frame, sample_table = gro_table, tax_table = tax_table, phylo_tree = tre_table)
+    dataset$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+    dataset$tax_table %<>% .[grepl("Bacteria|Archaea", .$Kingdom), ]
+    dataset$tax_table %<>% tidy_taxonomy()
+    dataset$tidy_dataset()
+    dataset$cal_abund()
+    dataset$cal_alphadiv(PD = TRUE)
+    dataset$cal_betadiv(unifrac = TRUE)
+    dataset
+})
+names(datasets) <- names(otu_tables)
+saveRDS(object = datasets, file = file.path(outdir_02, "microgeo_datasets.Rds"))
+
+# 3. 环境参数分析
+## 创建结果目录
+outdir_03 <- "results/03.env-summary"
+if (!outdir_03 %>% dir.exists) dir.create(outdir_03, recursive = T)
+
+## 提取两种生态系统类型的环境参数数据
+grop_ns <- gro_table[which(gro_table$SlopeType == 'NS'),]
+grop_cs <- gro_table[which(gro_table$SlopeType == 'CS'),]
+meta_ns <- met_table[rownames(grop_ns),] 
+meta_cs <- met_table[rownames(grop_cs),]
+meta_ns <- data.frame(elev = grop_ns$Elevation, meta_ns) %>% reshape2::melt()
+meta_cs <- data.frame(elev = grop_cs$Elevation, meta_cs) %>% reshape2::melt() 
+meta_ns$elev <- factor(meta_ns$elev, levels = args$elev_order)
+meta_cs$elev <- factor(meta_cs$elev, levels = args$elev_order)
+meta_ns$variable <- factor(meta_ns$variable, levels = use_env_vars)
+meta_cs$variable <- factor(meta_cs$variable, levels = use_env_vars)
+
+## 绘制箱线图并进行差异检验
+compare_list <- list(c('2900', '3102'), c('2900', '3194'), c('3102', '3194'))
+(p.env.ns <- ggpubr::ggboxplot(meta_ns, x = "elev", y = "value", fill = "elev", xlab = "Elevation (m)", ylab = "Observed values") + 
+        theme_gray() + 
+        scale_fill_manual(values = args$elev_color) + 
+        theme(legend.position = 'none', axis.title = element_text(size = 10), axis.text = element_text(size = 8), 
+              strip.text = element_text(size = 10)) + 
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) + 
+        facet_wrap(~variable, scales = 'free_y', ncol = 5) )
+(p.env.cs <- ggpubr::ggboxplot(meta_cs, x = "elev", y = "value", fill = "elev", xlab = "Elevation (m)", ylab = "Observed values") + 
+        theme_gray() + 
+        scale_fill_manual(values = args$elev_color) + 
+        theme(legend.position = 'none', axis.title = element_text(size = 10), axis.text = element_text(size = 8),
+              strip.text = element_text(size = 10)) + 
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) + 
+        facet_wrap(~variable, scales = 'free_y', ncol = 5) )
+saved <- savePDF(object = p.env.ns, path = outdir_03, filename = "NS环境参数在海拔上的变化.pdf", width = 7.93, height = 5.73)
+saved <- savePDF(object = p.env.cs, path = outdir_03, filename = "CS环境参数在海拔上的变化.pdf", width = 7.93, height = 5.73)
+
+# 4. alpha多样性分析
+## 创建结果目录
+outdir_04 <- "results/04.alpha-div"
+if (!outdir_04 %>% dir.exists) dir.create(outdir_04, recursive = T)
+
+## 计算alpha多样性指数
+alpha_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    dataset_name <- names(datasets)[x]
+    dat <- data.frame(row.names = rownames(dataset$alpha_diversity), 
+                      sample_ids = rownames(dataset$alpha_diversity), 
+                      shannon = dataset$alpha_diversity$Shannon)
+    dat <- base::merge(x = dat, y = gro_table, by.x = 'sample_ids', by.y = 'ID', all.x = T, all.y = T)
+    dat$type <- rep(dataset_name, nrow(dat))
+    dat
+}) %>% do.call('rbind', .)
+alpha_rst$type <- factor(alpha_rst$type, levels = args$taxa_type_full_order)
+alpha_rst$Elevation <- factor(alpha_rst$Elevation, levels = args$elev_order)
+alpha_rst$SlopeType <- factor(alpha_rst$SlopeType, levels = args$slop_order)
+
+## 绘制alpha多样性图
+p.alpha.1 <- ggplot(alpha_rst, aes(x = Elevation, y = shannon)) + 
+    geom_boxplot(aes(fill = SlopeType), outlier.size = 0.5) + 
+    theme_bw() + xlab("Elevation (m)") + ylab("Shannon-Weiner index") + 
+    scale_fill_manual(values = args$slop_color) + 
+    ggpubr::stat_compare_means(aes(group = SlopeType), label = "p.format", method = "t.test") +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.position = c(0.2, 0.62), strip.text = element_text(size = 12)) + 
+    facet_wrap(~type, ncol = 1, scales = 'free_y')
+
+## 计算所有ASV多样性和不同ASV多样性的相关性
+all_alpha_data <- alpha_rst[which(alpha_rst$type == 'all'),]
+colnames(all_alpha_data)[2] <- "shannon_all"
+all_alpha_data <- all_alpha_data[,-which(colnames(all_alpha_data) == 'type')]
+split_dat_names <- args$taxa_type_part_order
+corr_df_data <- lapply(split_dat_names, function(name){
+    tmp_alp_dat <- alpha_rst[which(alpha_rst$type == name),]
+    if (length(unique(all_alpha_data$sample_ids == tmp_alp_dat$sample_ids)) > 1 || !unique(all_alpha_data$sample_ids == tmp_alp_dat$sample_ids)){
+        stop('error!')
+    }
+    res <- data.frame(all_alpha_data, shannon_split = tmp_alp_dat$shannon, type = rep(name, nrow(tmp_alp_dat)))
+}) %>% do.call('rbind', .)
+corr_df_data$type <- factor(corr_df_data$type, levels = args$taxa_type_part_order)
+corr_df_data$SlopeType <- factor(corr_df_data$SlopeType, levels = args$slop_order)
+
+## 绘制相关性散点图并和alpha多样性变化趋势图合并
+p.alpha.2 <- ggplot(corr_df_data, aes(x = shannon_all, y = shannon_split, group = SlopeType)) + 
+    geom_point(aes(fill = SlopeType), color = 'gray70', shape = 21) + 
+    geom_smooth(method = 'lm', aes(color = SlopeType)) + 
+    scale_fill_manual(values = args$slop_color) + 
+    scale_color_manual(values = args$slop_color) + 
+    ggpubr::stat_cor(aes(color = SlopeType), method = 'pearson') + 
+    theme_bw() + xlab("Shannon-Weiner index of all taxa") + ylab("Shannon-Weiner index of ranked taxa") + 
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+          strip.text = element_text(size = 12), legend.position = c(0.8, 0.82)) + 
+    facet_wrap(~type, ncol = 1, scales = 'free_y')
+(p.alpha <- cowplot::plot_grid(p.alpha.1, p.alpha.2, nrow = 1, labels = c("A", "B"), label_size = 18))
+saved <- savePDF(object = p.alpha, path = outdir_04, filename = "alpha多样性变化趋势图.pdf", width = 8.28, height = 11.27)
+
+## 计算alpha多样性驱动因子
+alpha_cor_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    dataset_name <- names(datasets)[x]
+    grop_ns <- gro_table[which(gro_table$SlopeType == 'NS'),]
+    grop_cs <- gro_table[which(gro_table$SlopeType == 'CS'),]
+    meta_ns <- met_table[rownames(grop_ns),] 
+    meta_cs <- met_table[rownames(grop_cs),]
+    alpha_div_ns <- dataset$alpha_diversity[rownames(grop_ns),]
+    alpha_div_cs <- dataset$alpha_diversity[rownames(grop_cs),]
+    shannon_ns <- data.frame(row.names = rownames(alpha_div_ns), shannon = alpha_div_ns$Shannon)
+    shannon_cs <- data.frame(row.names = rownames(alpha_div_cs), shannon = alpha_div_cs$Shannon)
+    if (length(unique(rownames(meta_ns) == rownames(shannon_ns))) > 1 || !unique(rownames(meta_ns) == rownames(shannon_ns))){
+        stop('error-01')
+    }
+    if (length(unique(rownames(meta_cs) == rownames(shannon_cs))) > 1 || !unique(rownames(meta_cs) == rownames(shannon_cs))){
+        stop('error-01')
+    }
+    corr_rst_ns <- psych::corr.test(x = shannon_ns, y = meta_ns, method = 'spearman', adjust = 'fdr')
+    corr_rst_cs <- psych::corr.test(x = shannon_cs, y = meta_cs, method = 'spearman', adjust = 'fdr')
+    res <- data.frame(r = c(corr_rst_ns$r, corr_rst_cs$r), 
+                      p = c(corr_rst_ns$p, corr_rst_cs$p),
+                      var = rep(corr_rst_ns$r %>% colnames, 2),
+                      slope = c(rep("NS", corr_rst_ns$r %>% length), rep("CS", corr_rst_cs$r %>% length)),
+                      type = rep(dataset_name, c(corr_rst_ns$r, corr_rst_cs$r) %>% length))  
+}) %>% do.call('rbind', .)
+alpha_cor_rst$signif <- cut(alpha_cor_rst$p, breaks=c(-Inf, 0.001, 0.01, 0.05, Inf), label=c("***", "**", "*", "")) 
+alpha_cor_rst$var <- factor(alpha_cor_rst$var, levels = use_env_vars)
+alpha_cor_rst$type <- factor(alpha_cor_rst$type, levels = args$taxa_type_full_order)
+alpha_cor_rst$slope <- factor(alpha_cor_rst$slope, levels = args$slop_order)
+(p_alpha_drivers <- ggplot(alpha_cor_rst, aes(x = var, y = type, fill = r)) + 
+        geom_tile() + geom_text(aes(label = paste0(round(r, 2), "\n", signif)), vjust = 0.6, size = 3, fontface = 'bold') + 
+        scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Spectral"), na.value = "white") + theme_gray() + 
+        theme(legend.position = 'right', axis.title = element_blank(), axis.text = element_text(size = 8),
+              strip.text = element_text(size = 10), legend.title = element_text(size = 12), 
+              legend.text = element_text(size = 10)) + 
+        facet_wrap(~slope, nrow = 2))
+saved <- savePDF(object = p_alpha_drivers, path = outdir_04, filename = "alpha多样性变化驱动因子.pdf", width = 5.33, height = 3.80)
+
+# 5. beta多样性分析
+## 创建结果目录
+outdir_05 <- "results/05.beta-div"
+if (!outdir_05 %>% dir.exists) dir.create(outdir_05, recursive = T)
+
+## 绘制PCoA图
+beta_data_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    t1 <- trans_beta$new(dataset = dataset, group = "Group", measure = "bray")
+    t1$cal_ordination(ordination = "PCoA")
+    t1$plot_ordination(plot_color = "Elevation", plot_shape = "SlopeType", 
+                       color_values = args$elev_color, plot_type = c("point", "ellipse"), point_size = 3)
+})
+names(beta_data_rst) <- names(datasets)
+p.beta.pcoa <- cowplot::plot_grid(beta_data_rst$all, beta_data_rst$abundant, beta_data_rst$rare, beta_data_rst$hyper_rare, 
+                              nrow = 2, labels = c("A", "B", "C", "D"), label_size = 18)
+
+## 计算距离矩阵之间的关系
+dist_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    dataset_name <- names(datasets)[x]
+    bray <- dataset$beta_diversity$bray 
+    ns_samples <- gro_table[which(gro_table$SlopeType == 'NS'),]$ID
+    cs_samples <- gro_table[which(gro_table$SlopeType == 'CS'),]$ID
+    ns_bray <- bray[ns_samples,ns_samples] %>% as.dist %>% as.vector
+    cs_bray <- bray[cs_samples,cs_samples] %>% as.dist %>% as.vector   
+    res <- data.frame(bray = c(ns_bray, cs_bray), 
+                      slope = c(rep("NS", length(ns_bray)), rep("CS", length(cs_bray))),
+                      type = rep(dataset_name, length(ns_bray) + length(cs_bray)))
+}) %>%do.call('rbind', .)
+dist_all_ns <- dist_rst[which(dist_rst$type == 'all' & dist_rst$slope == 'NS'),]
+dist_ran_ns <- dist_rst[which(dist_rst$type != 'all' & dist_rst$slope == 'NS'),]
+dist_all_cs <- dist_rst[which(dist_rst$type == 'all' & dist_rst$slope == 'CS'),]
+dist_ran_cs <- dist_rst[which(dist_rst$type != 'all' & dist_rst$slope == 'CS'),]
+dist_plotdat_ns <- data.frame(all_bray = rep(dist_all_ns$bray, 3), 
+                              ran_bray = dist_ran_ns$bray, 
+                              ran_type = dist_ran_ns$type,
+                              slope = rep("NS", length(dist_ran_ns$bray)))
+dist_plotdat_cs <- data.frame(all_bray = rep(dist_all_cs$bray, 3), 
+                              ran_bray = dist_ran_cs$bray, 
+                              ran_type = dist_ran_cs$type,
+                              slope = rep("CS", length(dist_ran_cs$bray)))
+dist_plotdat <- rbind(dist_plotdat_ns, dist_plotdat_cs)
+dist_plotdat$ran_type <- factor(dist_plotdat$ran_type, levels = args$taxa_type_part_order)
+dist_plotdat$slope <- factor(dist_plotdat$slope, levels = args$slop_order)
+p.bray.cor <- ggplot(dist_plotdat, aes(x = all_bray, y = ran_bray, group = slope)) + 
+    geom_point(aes(fill = slope), color = 'gray70', shape = 21) + 
+    geom_smooth(method = 'lm', aes(color = slope)) + 
+    scale_fill_manual(values = args$slop_color) + 
+    scale_color_manual(values = args$slop_color) + 
+    ggpubr::stat_cor(aes(color = slope), method = 'pearson') + 
+    theme_bw() + xlab("Bray-Curtis distance of all taxa") + ylab("Bray-Curtis distance of ranked taxa") + 
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = c(0.8, 0.82)) + 
+    facet_wrap(~ran_type, ncol = 1, scales = 'free_y')
+(p.beta <- ggpubr::ggarrange(p.beta.pcoa, p.bray.cor, ncol = 2, labels = c("", "E"), widths = c(6, 2),
+                             font.label = list(size = 18, color = "black", face = "bold", family = NULL)))
+saved <- savePDF(object = p.beta, path = outdir_05, filename = "beta多样性变化趋势图.pdf", width = 11.07, height = 6.84)
+
+## beta多样性驱动因素
+beta_cor_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    dataset_name <- names(datasets)[x]
+    bray <- dataset$beta_diversity$bray 
+    ns_samples <- gro_table[which(gro_table$SlopeType == 'NS'),]$ID
+    cs_samples <- gro_table[which(gro_table$SlopeType == 'CS'),]$ID
+    ns_meta <- met_table[ns_samples,]
+    cs_meta <- met_table[cs_samples,]
+    ns_meta_dist <- lapply(X = ns_meta %>% ncol %>% seq, function(x) ns_meta[,x] %>% dist %>% as.vector) %>% do.call("cbind",.)
+    colnames(ns_meta_dist) <- colnames(ns_meta)
+    cs_meta_dist <- lapply(X = cs_meta %>% ncol %>% seq, function(x) cs_meta[,x] %>% dist %>% as.vector) %>% do.call("cbind",.)
+    colnames(cs_meta_dist) <- colnames(cs_meta)
+    ns_bray <- bray[ns_samples,ns_samples] %>% as.dist %>% as.vector
+    cs_bray <- bray[cs_samples,cs_samples] %>% as.dist %>% as.vector   
+    corr_rst_ns <- psych::corr.test(x = ns_bray, y = ns_meta_dist, method = 'spearman', adjust = 'fdr')
+    corr_rst_cs <- psych::corr.test(x = cs_bray, y = cs_meta_dist, method = 'spearman', adjust = 'fdr')
+    res <- data.frame(r = c(corr_rst_ns$r, corr_rst_cs$r), 
+                      p = c(corr_rst_ns$p, corr_rst_cs$p),
+                      var = rep(corr_rst_ns$r %>% colnames, 2),
+                      slope = c(rep("NS", corr_rst_ns$r %>% length), rep("CS", corr_rst_cs$r %>% length)),
+                      type = rep(dataset_name, c(corr_rst_ns$r, corr_rst_cs$r) %>% length))     
+}) %>%do.call('rbind', .)
+beta_cor_rst$signif <- cut(beta_cor_rst$p, breaks=c(-Inf, 0.001, 0.01, 0.05, Inf), label=c("***", "**", "*", "")) 
+beta_cor_rst$var <- factor(beta_cor_rst$var, levels = use_env_vars)
+beta_cor_rst$type <- factor(beta_cor_rst$type, levels = args$taxa_type_full_order)
+beta_cor_rst$slope <- factor(beta_cor_rst$slope, levels = args$slop_order)
+(p_beta_drivers <- ggplot(beta_cor_rst, aes(x = var, y = type, fill = r)) + 
+        geom_tile() + geom_text(aes(label = paste0(round(r, 2), "\n", signif)), vjust = 0.6, size = 3, fontface = 'bold') + 
+        scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Spectral"), na.value = "white") + theme_gray() + 
+        theme(legend.position = 'right', axis.title = element_blank(), axis.text = element_text(size = 8),
+              strip.text = element_text(size = 10), legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_wrap(~slope, nrow = 2))
+saved <- savePDF(object = p_beta_drivers, path = outdir_05, filename = "beta多样性变化驱动因子.pdf", width = 5.33, height = 3.80)
+
+# 6. 功能冗余分析
+## 创建结果目录
+outdir_06 <- "results/06.func_red"
+if (!outdir_06 %>% dir.exists) dir.create(outdir_06, recursive = T)
+
+## 将KEGG拷贝数数据存储到磁盘
+if (!file.exists(file.path(outdir_06, "funtionalRedundancyCalData.Rds")))
+    saveRDS(list(otu_tables = otu_tables, kegg_copies = kegg_copies), file.path(outdir_06, "funtionalRedundancyCalData.Rds"))
+
+## 定义一个函数计算功能冗余
+## 不要在自己电脑上运行，90个线程哪有那么强性能的PC机。。。。
+## 计算完成后，将`calculatedFuntionalRedundancy.Rds`文件下载到本地进一步分析
+if (FALSE) {
+    calc_fr = function(rds_file_path){
+        require(magrittr)
+        source("功能冗余计算函数多线程.r")
+        input_data <- readRDS(rds_file_path)
+        otu_tables <- input_data$otu_tables
+        kegg_copies <- input_data$kegg_copies
+        fr_rst <- lapply(X = otu_tables %>% length %>% seq, function(x){
+            tab <- otu_tables[[x]]
+            nam <- names(otu_tables)[x]
+            cat(paste("## [", Sys.time(), '] ## start to process `', nam, '`...', sep = ''), fill = T)
+            tab <- tab %>% t
+            kegg_copies <- kegg_copies[which(rownames(kegg_copies) %in% rownames(tab)),]
+            kegg_copies <- kegg_copies[,apply(kegg_copies, 2, sum) > 0]
+            func_dist <- parallelDistCal(kegg_copies, threads = 90)
+            fr <- FunctionalRedParallelDist(comm = tab, dis = func_dist, threads = 90)
+        })
+        names(fr_rst) <- names(otu_tables)
+        saveRDS(fr_rst, "calculatedFuntionalRedundancy.Rds")
+    }
+    calc_fr("funtionalRedundancyCalData.Rds") # 在服务器上运行该函数，计算量非常巨大！
+}
+
+## 读入计算好的功能冗余结果
+fr_rst <- readRDS(file.path(outdir_06, "calculatedFuntionalRedundancy.Rds"))
+
+## 提取功能冗余数据用于绘图
+fred <- lapply(fr_rst %>% length %>% seq, function(x){
+    object <- fr_rst[[x]]
+    name <- names(fr_rst)[x]
+    red <- data.frame(sample = rownames(object$red), 
+                      R = 1 - object$red$U, type = rep(name, nrow(object$red)))
+    if (name == "hyper_rare") {
+        red$R <- red$R/4097
+    }else if (name == "rare") {
+        red$R <- red$R/4172
+    }else if (name == "abundant") {
+        red$R <- red$R/647
+    }
+    red <- base::merge(x = red, y = gro_table, by.x = 'sample', by.y = 'ID', all.x = T, all.y = T)
+    colnames(red) <- c('sample', 'r', 'type', 'elev', 'slope', 'group')
+    red
+}) %>% do.call('rbind', .)
+fred$type <- factor(fred$type, levels = args$taxa_type_full_order)
+fred$elev <- factor(fred$elev, levels = args$elev_order)
+fred$slope <- factor(fred$slope, levels = args$slop_order)
+
+## 绘制功能冗余图变化趋势图
+p.red.1 <- ggplot(fred, aes(x = elev, y = r)) + 
+    geom_boxplot(aes(fill = slope), outlier.size = 0.5) + 
+    theme_bw() + xlab("Elevation (m)") + ylab("Functional redundancy") + 
+    scale_fill_manual(values = args$slop_color) + 
+    ggpubr::stat_compare_means(aes(group = slope), label = "p.format", method = "t.test") +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.position = c(0.2, 0.62),
+          strip.text = element_text(size = 12)) + 
+    facet_wrap(~type, ncol = 1, scales = 'free_y')
+
+## 计算所有ASV功能冗余和不同ASV功能冗余的相关性
+all_red_data <- fred[which(fred$type == 'all'),]
+colnames(all_red_data)[2] <- "r_all"
+all_red_data <- all_red_data[,-which(colnames(all_red_data) == 'type')]
+split_dat_names <- c('hyper_rare', "rare","abundant")
+corr_df_data_red <- lapply(split_dat_names, function(name){
+    tmp_red_dat <- fred[which(fred$type == name),]
+    if (length(unique(all_red_data$sample == tmp_red_dat$sample)) > 1 || !unique(all_red_data$sample == tmp_red_dat$sample)){
+        stop('error!')
+    }
+    res <- data.frame(all_red_data, r_split = tmp_red_dat$r, type = rep(name, nrow(tmp_red_dat)))
+}) %>% do.call('rbind', .)
+corr_df_data_red$type <- factor(corr_df_data_red$type, levels = args$taxa_type_part_order)
+corr_df_data_red$slope <- factor(corr_df_data_red$slope, levels = args$slop_order)
+p.red.2 <- ggplot(corr_df_data_red, aes(x = r_all, y = r_split, group = slope)) + 
+    geom_point(aes(fill = slope), color = 'gray70', shape = 21) + 
+    geom_smooth(method = 'lm', aes(color = slope)) + 
+    scale_fill_manual(values = args$slop_color) + 
+    scale_color_manual(values = args$slop_color) + 
+    ggpubr::stat_cor(aes(color = slope), method = 'pearson') + 
+    theme_bw() + xlab("Functional redundancy of all taxa") + ylab("Functional redundancy of ranked taxa") + 
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+          strip.text = element_text(size = 12), legend.position = c(0.8, 0.82)) + 
+    facet_wrap(~type, ncol = 1, scales = 'free_y')
+(p.red <- cowplot::plot_grid(p.red.1, p.red.2, nrow = 1, labels = c("A", "B"), label_size = 18))
+saved <- savePDF(object = p.red, path = outdir_06, filename = "功能冗余变化趋势图.pdf", width = 8.28, height = 11.27)
+
+## 功能冗余驱动因素
+fred_cor_rst <- lapply(X = unique(fred$type), function(type){
+    tmp <- fred[which(fred$type == type),]
+    tmp.ns <- tmp[which(tmp$slope == 'NS'),]
+    tmp.cs <- tmp[which(tmp$slope == 'CS'),]
+    ns_meta <- met_table[tmp.ns$sample,]
+    cs_meta <- met_table[tmp.cs$sample,]
+    corr_rst_ns <- psych::corr.test(x = tmp.ns$r, y = ns_meta, method = 'spearman', adjust = 'fdr')
+    corr_rst_cs <- psych::corr.test(x = tmp.cs$r, y = cs_meta, method = 'spearman', adjust = 'fdr')
+    res <- data.frame(r = c(corr_rst_ns$r, corr_rst_cs$r), 
+                      p = c(corr_rst_ns$p, corr_rst_cs$p),
+                      var = rep(corr_rst_ns$r %>% colnames, 2),
+                      slope = c(rep("NS", corr_rst_ns$r %>% length), rep("CS", corr_rst_cs$r %>% length)),
+                      type = rep(type, c(corr_rst_ns$r, corr_rst_cs$r) %>% length))    
+}) %>% do.call('rbind', .)
+fred_cor_rst$signif <- cut(fred_cor_rst$p, breaks=c(-Inf, 0.001, 0.01, 0.05, Inf), label=c("***", "**", "*", "")) 
+fred_cor_rst$var <- factor(fred_cor_rst$var, levels = use_env_vars)
+fred_cor_rst$type <- factor(fred_cor_rst$type, levels = args$taxa_type_full_order)
+fred_cor_rst$slope <- factor(fred_cor_rst$slope, levels = args$slop_order)
+(p_fred_drivers <- ggplot(fred_cor_rst, aes(x = var, y = type, fill = r)) + 
+        geom_tile() + geom_text(aes(label = paste0(round(r, 2), "\n", signif)), vjust = 0.6, size = 3, fontface = 'bold') + 
+        scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Spectral"), na.value = "white") + theme_gray() + 
+        theme(legend.position = 'right', axis.title = element_blank(), axis.text = element_text(size = 8),
+              strip.text = element_text(size = 10), legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_wrap(~slope, nrow = 2))
+saved <- savePDF(object = p_fred_drivers, path = outdir_06, filename = "功能冗余变化驱动因子.pdf", width = 5.33, height = 3.80)
+
+## 将alpha多样性、beta多样性和fred的相关性结果绘制到一张图上
+alpha_cor_rst$index <- rep("Shannon-Wiener", nrow(alpha_cor_rst))
+beta_cor_rst$index <- rep("Bray-Curtis distance", nrow(beta_cor_rst))
+fred_cor_rst$index <- rep("Functional redundancy", nrow(fred_cor_rst))
+all_cor_rst <- rbind(alpha_cor_rst, beta_cor_rst, fred_cor_rst)
+all_cor_rst$index <- factor(all_cor_rst$index, levels = c("Shannon-Wiener", "Bray-Curtis distance", "Functional redundancy"))
+(p_all_cor_rst <- ggplot(all_cor_rst, aes(x = var, y = type, fill = r)) + 
+        geom_tile(color = 'white') + 
+        geom_text(aes(label = paste0(round(r, 2), "\n", signif)), vjust = 0.6, size = 3, fontface = 'bold') + 
+        scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "BrBG") %>% rev, na.value = "white") + theme_gray() + 
+        theme(legend.position = 'right', axis.title = element_blank(), axis.text = element_text(size = 8),
+              strip.text = element_text(size = 10), legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_grid(index~slope))
+saved <- savePDF(object = p_all_cor_rst, path = outdir_06, filename = "所有的驱动因子.pdf", width = 11.23, height = 6.61)
+
+## 比较不同类别ASV的功能冗余
+fred.agg.mean <- aggregate(fred$r, by = list(fred$type, fred$elev, fred$slope), FUN = mean)
+fred.agg.sd <- aggregate(fred$r, by = list(fred$type, fred$elev, fred$slope), FUN = sd)
+colnames(fred.agg.mean) <- c("type", "elev", "slope", "mean_r")
+fred.agg.mean$sd <- fred.agg.sd$x
+fred.agg.mean$se <- lapply(X = fred.agg.mean %>% nrow %>% seq, function(x){
+    type <- fred.agg.mean[x,]$type %>% as.character()
+    elev <- fred.agg.mean[x,]$elev %>% as.character()
+    slope <- fred.agg.mean[x,]$slope %>% as.character()
+    sample_num <- nrow(fred[which(fred$type == type & fred$elev == elev & fred$slope == slope),])
+    se <- fred.agg.mean[x,]$sd/sqrt(sample_num)
+}) %>% unlist()
+fred.agg.mean$type <- factor(fred.agg.mean$type, levels = args$taxa_type_full_order)
+fred.agg.mean$slope <- factor(fred.agg.mean$slope, levels = args$slop_order)
+dfff_red_test_rst <- lapply(unique(fred$elev), function(ele){
+    dt1 <- fred[which(fred$elev == ele),]
+    res <- lapply(unique(dt1$slope), function(slo){
+        dt2 <- dt1[which(dt1$slope == slo),]
+        dt2 <- dt2[which(dt2$type != 'all'),]
+        tab1 <- data.frame(r = dt2$r, r1 = dt2$r); rownames(tab1) <- seq(nrow(tab1))
+        tab2 <- dt2[,c('sample', 'type')]; rownames(tab2) <- seq(nrow(tab2))
+        test.res <- NonparametricPairWiseTest(abund_table = tab1 , grouping_info = tab2, method = 'wrst', group_col = 2, signif = 0.05, FDR_USE = F)
+        alphabet <- getAlphaBeta(RstDf = test.res$all_result, testVarCol = 1, GroupA_col = 2, GroupB_col = 3, Pvalue_col = 11, cutoffs = 0.05)
+        alphabet <- alphabet[which(alphabet$Var != 'r1'),]
+        dd.rst <- data.frame(alphabet, Elev = rep(ele, nrow(alphabet)), Slope = rep(slo, nrow(alphabet)))
+    }) %>% do.call('rbind', .)
+    res
+}) %>% do.call('rbind', .)
+colnames(dfff_red_test_rst) <- c('type', 'letters', 'r', 'elev', 'slope')
+dfff_red_test_rst$y_pos <- lapply(X = dfff_red_test_rst %>% nrow %>% seq, function(x){
+    type <- dfff_red_test_rst$type[x]
+    elev <- dfff_red_test_rst$elev[x] %>% as.character()
+    slope <- dfff_red_test_rst$slope[x] %>% as.character()
+    mean_r <- fred.agg.mean[which(fred.agg.mean$type == type & fred.agg.mean$elev == elev & fred.agg.mean$slope == slope),]$mean_r
+    mean_sd <- fred.agg.mean[which(fred.agg.mean$type == type & fred.agg.mean$elev == elev & fred.agg.mean$slope == slope),]$sd
+    mean_r + mean_sd
+}) %>% unlist()
+dfff_red_test_rst$type <- factor(dfff_red_test_rst$type, levels = args$taxa_type_part_order)
+(p_fred_by_type <- ggplot(fred.agg.mean[which(fred.agg.mean$type != 'all'),], aes(x = elev, y = mean_r)) + 
+        geom_errorbar(aes(ymin = mean_r - sd, ymax = mean_r + sd, color = type), position = position_dodge(0.8), width = 0.2) + 
+        #geom_point(position = position_dodge(0.8), aes(fill = type), shape = 21, size = 6) + 
+        geom_bar(position = position_dodge(0.8), aes(fill = type), stat = 'identity', width = 0.8) + 
+        geom_text(data = dfff_red_test_rst, aes(x = elev, y = y_pos, label = letters, color = type), position = position_dodge(0.8), vjust = -0.5) + 
+        scale_fill_manual(values = args$taxa_type_part_color) + 
+        scale_color_manual(values = args$taxa_type_part_color) + 
+        theme_bw() + xlab("Elevation (m)") + ylab("Functional redundancy") + 
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+              legend.position = c(0.46, 0.55), strip.text = element_text(size = 12), 
+              legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_wrap(~slope, scales = 'fixed'))
+saved <- savePDF(object = p_fred_by_type, path = outdir_06, filename = "不同类别ASV的功能冗余.pdf", width = 8.28, height = 4.08)
+
+
+# 7. 群物种组成
+## 创建结果目录
+outdir_07 <- "results/07.taxa_compos"
+if (!outdir_07 %>% dir.exists) dir.create(outdir_07, recursive = T)
+
+## 计算相对丰度
+abund_rst_all <- lapply(datasets %>% length %>% seq, function(x){
+    
+    ## 准备数据
+    dataset <- datasets[[x]]
+    dataset_name <- names(datasets)[x]
+    dataset$sample_table$group <- paste0(dataset$sample_table$Elevation, "_", dataset$sample_table$SlopeType)
+    
+    ## 差异分析
+    t1 <- trans_diff$new(dataset = dataset, method = "KW", group = "group", taxa_level = "Phylum", alpha = 0.01)
+    sig_genus <- t1$res_diff[which(t1$res_diff$P.adj <= 0.01),]$Taxa
+    sig_genus <- lapply(sig_genus, function(g){
+        gg <- strsplit(g, split = '|', fixed = TRUE) %>% unlist
+        gg1 <- gg[2] %>% strsplit(., split = '__', fixed = TRUE) %>% unlist
+        gg1[2]
+    }) %>% unlist
+    
+    ## 准备绘图数据：差异类群
+    t2 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", groupmean = "group", input_taxaname = sig_genus)
+    p <- t2$plot_bar(others_color = "grey70", legend_text_italic = FALSE, bar_type = 'notfull')
+    dat <- p$data
+    dat$type <- rep(dataset_name, nrow(dat))
+    
+    ## 准备绘图数据：前10类群
+    t3 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 10, groupmean = "group")
+    p2 <- t3$plot_bar(others_color = "grey70", legend_text_italic = FALSE, bar_type = 'notfull')
+    dat2 <- p2$data
+    dat2$elev <- lapply(dat2$Sample, function(samp){
+        rst <- strsplit(samp, split = '_', fixed = TRUE) %>% unlist
+        rst[1]
+    }) %>% unlist
+    dat2$slope <- lapply(dat2$Sample, function(slope){
+        rst <- strsplit(slope, split = '_', fixed = TRUE) %>% unlist
+        rst[2]
+    }) %>% unlist
+    
+    ## 绘制组成图
+    p.full <- ggplot(dat2, aes(x = elev, y = Abundance, fill = Taxonomy)) + 
+        geom_bar(stat = 'identity', position = 'stack') + 
+        scale_fill_manual(values = RColorBrewer::brewer.pal(12, "Paired")) + 
+        theme_bw() + xlab("Elevation (m)") + ylab("Relative abundance (%)") + 
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+              strip.text = element_text(size = 12), 
+              legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_wrap(~slope, scales = 'free_y')
+    
+    ## 返回数据
+    res <- list(dat = dat, p.full = p.full)
+})
+
+## 将所有类群的组成图保存到文件
+p.full_rst <- lapply(abund_rst_all, function(obj) obj$p.full) 
+(p.full.all <- ggpubr::ggarrange(plotlist = p.full_rst, ncol = 1, common.legend = T, labels = c("A", "B", "C", "D"),
+                                 font.label = list(size = 18, color = "black", face = "bold", family = NULL)))
+saved <- savePDF(object = p.full.all, path = outdir_07, filename = "物种组成图-所有的.pdf", width = 8.09, height = 13.66)
+
+## 重新整理数据并绘制差异类群的组成图
+abund_rst <- lapply(abund_rst_all, function(obj) obj$dat) %>% do.call('rbind', .)
+abund_rst$elev <- lapply(abund_rst$Sample, function(samp){
+    rst <- strsplit(samp, split = '_', fixed = TRUE) %>% unlist
+    rst[1]
+}) %>% unlist
+abund_rst$slope <- lapply(abund_rst$Sample, function(slope){
+    rst <- strsplit(slope, split = '_', fixed = TRUE) %>% unlist
+    rst[2]
+}) %>% unlist
+abund_rst$type <- factor(abund_rst$type, levels = args$taxa_type_full_order)
+abund_rst$elev <- factor(abund_rst$elev, levels = args$elev_order)
+abund_rst$slope <- factor(abund_rst$slope, levels = args$slop_order)
+(p.compos <- ggplot(abund_rst, aes(x = elev, y = Abundance, fill = Taxonomy)) + 
+        geom_bar(stat = 'identity', position = 'stack') + 
+        scale_fill_manual(values = c("#1f78b4", "#33a02c", "#e31a1c", "#ff7f00", "#6a3d9a", "#a6cee3", "black", "#fb9a99", "#fdbf6f",
+                                     "#cab2d6", "#ffff99", "#666666", "darkred", "#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "blue")) + 
+        theme_bw() + xlab("Elevation (m)") + ylab("Relative abundance (%)") + 
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+              strip.text = element_text(size = 12), 
+              legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+        facet_grid(type~slope, scales = 'free_y'))
+saved <- savePDF(object = p.compos, path = outdir_07, filename = "物种组成图.pdf", width = 6.86, height = 8.55)
+
+## 相关分析：高丰度的Acidobacteria、Bacteroidetes和Cyanobacteria
+abund_dataset <- datasets$abundant
+abund_t1 <- trans_env$new(dataset = abund_dataset, add_data = met_table)
+abund_t1$cal_cor(use_data = "Phylum", p_adjust_method = "none", cor_method = "spearman", by_group = "SlopeType")
+abund_t1$plot_cor(pheatmap = T)

@@ -1,0 +1,27 @@
+## read grouping table
+gro_table <- xlsx::read.xlsx("rawdata/metadata-table.xlsx", sheetIndex = 1, as.data.frame = T)
+rownames(gro_table) <- gro_table$ID
+gro_table$Elevation <- as.character(gro_table$Elevation)
+gro_table %>% head
+
+## read ASV table
+otu_table <- read.table("rawdata/feature-table.tsv", header = T, sep = '\t', comment.char = "", skip = 1)
+otu_table <- otu_table[,c('X.OTU.ID', intersect(gro_table$ID, colnames(otu_table)))]
+colnames(otu_table)[1] <- 'OTUID'
+otu_table <- otu_table[apply(otu_table[,2:ncol(otu_table)], 1, sum) > 0,]
+write.table(x = otu_table, file = 'rawdata/asv-table-resampled-8000.tsv', sep = '\t', row.names = F, col.names = T)
+
+## read KEGG copy numbers 
+kegg_copies <- data.table::fread("rawdata/KO_predicted.tsv.gz", sep = '\t', header = T, nThread = 5) %>% as.data.frame()
+rownames(kegg_copies) <- kegg_copies$sequence; kegg_copies <- kegg_copies[,-1]
+kegg_copies %>% dim()
+kegg_copies <- kegg_copies[otu_table$OTUID,]
+kegg_copies <- kegg_copies[,apply(kegg_copies, 2, sum) > 0]
+kegg_copies <- data.frame(OTUID = rownames(kegg_copies), kegg_copies)
+write.table(x = kegg_copies, file = 'rawdata/ko-copies-for-each-asv.tsv', sep = '\t', row.names = F, col.names = T)
+
+## 读取物种分类信息表
+tax_table <- data.table::fread("rawdata/taxonomy-silva-138.tsv", sep = '\t') %>% as.data.frame
+rownames(tax_table) <- tax_table$`Feature ID`
+tax_table <- tax_table[rownames(otu_table),]
+write.table(x = tax_table, file = 'rawdata/asv-taxonomy-silva-138.tsv', sep = '\t', row.names = F, col.names = T)

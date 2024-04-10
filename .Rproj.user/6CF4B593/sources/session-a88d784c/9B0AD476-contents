@@ -1,0 +1,36 @@
+
+
+
+## 准备绘图数据：差异类群
+t2 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", groupmean = "group", input_taxaname = sig_taxa)
+p <- t2$plot_bar(others_color = "grey70", legend_text_italic = FALSE, bar_type = 'notfull')
+dat <- p$data
+dat$type <- rep(dataset_name, nrow(dat))
+
+
+
+## 准备绘图数据：前10类群
+t3 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 10, groupmean = "group")
+p2 <- t3$plot_bar(others_color = "grey70", legend_text_italic = FALSE, bar_type = 'notfull')
+dat2 <- p2$data
+dat2$elev <- lapply(dat2$Sample, function(samp){
+    rst <- strsplit(samp, split = '_', fixed = TRUE) %>% unlist
+    rst[1]
+}) %>% unlist
+dat2$slope <- lapply(dat2$Sample, function(slope){
+    rst <- strsplit(slope, split = '_', fixed = TRUE) %>% unlist
+    rst[2]
+}) %>% unlist
+
+## 绘制组成图
+p.full <- ggplot(dat2, aes(x = elev, y = Abundance, fill = Taxonomy)) + 
+    geom_bar(stat = 'identity', position = 'stack') + 
+    scale_fill_manual(values = RColorBrewer::brewer.pal(12, "Paired")) + 
+    theme_bw() + xlab("Elevation (m)") + ylab("Relative abundance (%)") + 
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+          strip.text = element_text(size = 12), 
+          legend.title = element_text(size = 12), legend.text = element_text(size = 10)) + 
+    facet_wrap(~slope, scales = 'free_y')
+
+## 返回数据
+res <- list(dat = dat, p.full = p.full)

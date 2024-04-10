@@ -1,0 +1,1037 @@
+# 0. 加载必要的R包
+require(magrittr)
+require(microeco)
+require(ggpubr)
+require(ggplot2)
+source('utils.r')
+source('vector-test.r')
+source('mantel-test.r')
+
+# 1. 读取原始数据
+## 创建结果目录
+outdir_01 <- createDir(rootPath = ".", dir = "results/01.read-files")
+
+## 读取细根降解速残留率数据
+dcp_table <- xlsx::read.xlsx("../../../metdata/metadata-forest-gap.xlsx", sheetIndex = 3, as.data.frame = T)
+rownames(dcp_table) <- dcp_table$ExperID
+dcp_table$Mon.3.ratio <- dcp_table$Mon.3/dcp_table$Init
+dcp_table$Mon.24.ratio <- dcp_table$Mon.24/dcp_table$Init
+dcp_table <- dcp_table[,c("ExperID", "Mon.3.ratio", "Mon.24.ratio")]
+dcp_table <- data.frame(ExperID = rep(dcp_table$ExperID, 2), DRR = c(dcp_table$Mon.3.ratio, dcp_table$Mon.24.ratio),
+                        Time = rep(c("Mon.3", "Mon.24"), each = nrow(dcp_table)))
+dim(dcp_table)
+
+## 读取分组和环境参数表
+met_table <- xlsx::read.xlsx("../../../metdata/metadata-forest-gap.xlsx", sheetIndex = 2, as.data.frame = T)
+rownames(met_table) <- met_table$SampleID
+
+## 将分 信 息表拆分出来
+gro_table <- met_table[,1:4]
+gro_table$Group <- paste0(gro_table$GapLoc, "_", gro_table$Time)
+
+## 将环境信息表拆分出来
+all_var <- c("ST",  "SWC", "pH",  "SOC", "STN", "SNP",  "RTC",  "RTN", "RCN", "RCa", "RMg", "RLig", "RCel", "RHem")
+sol_var <- c("ST",  "SWC", "pH",  "SOC", "STN", "SNP")
+pln_var <- c("RTC", "RTN", "RCN", "RCa", "RMg", "RLig", "RCel", "RHem")
+env_table <- met_table[,all_var] # 所有参数
+sol_table <- met_table[,sol_var] # 土壤参数
+pln_table <- met_table[,pln_var] # 植被参数
+
+## 根据`gro_table`整理一下细根降解速残留率数据
+drr_table <- lapply(X = seq(nrow(gro_table)), function(x){
+    SampleID <- gro_table$SampleID[x]
+    ExperID <- gro_table$ExperID[x]
+    Time <- gro_table$Time[x]
+    dcp <- dcp_table[which(dcp_table$ExperID == ExperID & dcp_table$Time == Time),]
+    DRR <- ifelse(nrow(dcp) == 0, NA, dcp$DRR)
+    data.frame(row.names = SampleID, SampleID = SampleID, DRR = DRR)
+}) %>% do.call('rbind', .)
+drr_table$DRR <- 1 - drr_table$DRR
+
+## 读取进化树
+tre_table <- ape::read.tree("../../../reports/06.phylotree/tree.nwk")
+
+## 读取OTU丰度表
+otu_table <- read.table("../../../reports/03.feature-table/feature-table-resampled-14899.tsv",
+                        header = T, sep = '\t', comment.char = "", skip = 1)
+rownames(otu_table) <- otu_table$X.OTU.ID; otu_table <- otu_table[,-1] ; otu_table <- t(otu_table)
+
+## 读取物种分类信息表
+tax_table <- data.table::fread("../../../reports/04.feature-annotation/taxonomy.tsv", sep = '\t') %>% as.data.frame
+rownames(tax_table) <- tax_table$`Feature ID`
+tax_table <- tax_table[colnames(otu_table),]
+tax_table %>% dim
+
+## 处理物种分类信息表
+tax_rst <- lapply(X = tax_table %>% nrow %>% seq, function(x){
+    tax_res <- tax_table$Taxon[x] %>% strsplit(., split = ";", fixed = T) %>% unlist
+    if (tax_res %>% length < 7) tax_res <- c(tax_res, rep(NA, 7 - length(tax_res)))
+    tax_res %<>% as.data.frame %>% t
+    colnames(tax_res) <- c('Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')
+    rownames(tax_res) <- rownames(tax_table)[x]
+    tax_res[1,] <- lapply(tax_res[1,], function(col) gsub("^(k__|p__|c__|o__|f__|g__|s__)", "", col)) %>% unlist
+    tax_res
+}) %>% do.call('rbind', .)
+tax_table <- cbind(tax_table, tax_rst)
+tax_table <- tax_table[,-c(1, 2, 3)]
+tax_table %>% dim
+
+## 计算可用样本: 取分组表和otu表中样本编号交集
+sampleIDs <- intersect(gro_table %>% rownames, otu_table %>% rownames)
+sampleIDs %>% length # 53
+
+## 排序
+gro_table <- gro_table[sampleIDs,]
+env_table <- env_table[sampleIDs,]
+sol_table <- sol_table[sampleIDs,]
+pln_table <- pln_table[sampleIDs,]
+drr_table <- drr_table[sampleIDs,]
+otu_table <- otu_table[sampleIDs,]
+tax_table <- tax_table[colnames(otu_table),]
+
+## 检查样本和OTU编号顺序：以`gro_table`中的样本顺序为标准；以`otu_table`中的ASV编号顺序为标准
+if (length(unique(rownames(otu_table) == rownames(gro_table))) > 1 || !unique(rownames(otu_table) == rownames(gro_table))){
+    stop("sample order error!")
+}
+if (length(unique(rownames(env_table) == rownames(gro_table))) > 1 || !unique(rownames(env_table) == rownames(gro_table))){
+    stop("sample order error!")
+}
+if (length(unique(rownames(sol_table) == rownames(gro_table))) > 1 || !unique(rownames(sol_table) == rownames(gro_table))){
+    stop("sample order error!")
+}
+if (length(unique(rownames(pln_table) == rownames(gro_table))) > 1 || !unique(rownames(pln_table) == rownames(gro_table))){
+    stop("sample order error!")
+}
+if (length(unique(rownames(drr_table) == rownames(gro_table))) > 1 || !unique(rownames(drr_table) == rownames(gro_table))){
+    stop("sample order error!")
+}
+if (length(unique(rownames(tax_table) == colnames(otu_table))) > 1 || !unique(rownames(tax_table) == colnames(otu_table))){
+    stop("asv order error!")
+}
+
+## 设置颜色和显示顺序
+args <- list(
+    all_var = c("ST","SWC","pH","SOC","STN","SNP","RTC","RTN","RCN","RCa","RMg","RLig","RCel","RHem"),
+    sol_var = c("ST","SWC","pH","SOC","STN","SNP"),
+    pln_var = c("RTC","RTN","RCN","RCa","RMg","RLig","RCel","RHem"),
+    gap_order = c('CC','GC', 'GB'),
+    tim_order = c('Mon.3','Mon.24'),
+    gap_color = RColorBrewer::brewer.pal(8, "Dark2")[1:3],
+    tim_color = RColorBrewer::brewer.pal(8, "Accent")[1:2]
+)
+
+## 创建microeco数据集并预测功能: lifestyle
+dataset <- microtable$new(otu_table = t(otu_table) %>% as.data.frame, sample_table = gro_table, tax_table = tax_table, phylo_tree = tre_table)
+dataset$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+dataset$tax_table %<>% .[grepl("Fungi", .$Kingdom), ]
+dataset$tax_table %<>% tidy_taxonomy()
+dataset$tidy_dataset()
+fun_pre <- trans_func$new(dataset = dataset)
+fun_pre$cal_spe_func(fungi_database = "FungalTraits")
+fun_res <- fun_pre$res_spe_func_raw_FungalTraits
+fun_res$primary_lifestyle <- lapply(fun_res$primary_lifestyle, function(lifestyle){
+    stringr::str_replace_all(stringr::str_to_title(lifestyle), "_", " ")
+}) %>% unlist()
+fun_res$primary_lifestyle[is.na(fun_res$primary_lifestyle)] <- 'Unclassified'
+fun_res$primary_lifestyle[which(fun_res$primary_lifestyle == 'Unspecified')] <- "Unclassified"
+fun_res <- data.frame(row.names = rownames(fun_res), asv = rownames(fun_res), lifestyle = fun_res$primary_lifestyle)
+fun_res_count_df <- table(fun_res$lifestyle) %>% as.data.frame()
+fun_res_count_df <- fun_res_count_df[order(fun_res_count_df$Freq, decreasing = F),]
+fun_res_count_df$Var1 <- factor(fun_res_count_df$Var1, levels = as.character(fun_res_count_df$Var1))
+fun_res_count_df$type <- ifelse(grepl("saprotroph", fun_res_count_df$Var1), 'Saprotrophs', 'Others')
+fun_res_count_df$type <- factor(fun_res_count_df$type, levels = c('Saprotrophs', 'Others'))
+unclassified_count <- fun_res_count_df[which(fun_res_count_df$Var1 == 'Unclassified'),]$Freq
+(p_lifestyle_type <- ggplot(fun_res_count_df[which(fun_res_count_df$Var1 != 'Unclassified'),], aes(x = Freq, y = Var1, fill = type)) +
+        geom_bar(stat = 'identity', position = 'dodge') +
+        geom_text(aes(label = Freq), color = 'black', hjust = -0.2, size = 3) +
+        geom_text(x = 10, y = 1, label = paste0("Failed to be predicted: ", unclassified_count), color = 'black', hjust = -0.2) +
+        scale_fill_manual(values = c("#33a02c", "gray30")) +  xlab("ASV number") + ylab("Fungal lifestyle") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = 'none', strip.text = element_text(size = 12)))
+
+## 将腐生菌全部合并到一起
+fun_res$is_saprotroph <- lapply(fun_res$lifestyle, function(lifestyle){
+    ifelse(grepl("saprotroph", lifestyle), "Saprotrophs", "Others")
+}) %>% unlist()
+fun_res_count_df_1 <- table(fun_res$is_saprotroph) %>% as.data.frame()
+fun_res_count_df_1$Var1 <- factor(fun_res_count_df_1$Var1, levels = c('Saprotrophs', 'Others'))
+(p_saprotrophs <- ggplot(fun_res_count_df_1, aes(x = "", y = Freq, fill = Var1)) +
+        geom_bar(stat = "identity") + theme_bw() +
+        scale_fill_manual(values = c("#33a02c", "gray30")) +  xlab("ASV number") + ylab("Fungal lifestyle") +
+        theme(axis.title = element_blank(),axis.text = element_blank(),axis.ticks = element_blank(),
+              legend.position = 'none', panel.grid = element_blank(), panel.border = element_blank(),
+              panel.background = element_blank()) +
+        coord_polar(theta = "y"))
+(p_lifestyle_type_final <- p_lifestyle_type + annotation_custom(ggplotGrob(p_saprotrophs), xmin = 50, xmax = 160, ymin = -38, ymax = 53))
+saved <- savePDF(object = p_lifestyle_type_final, path = outdir_01, filename = "不同生活型真菌ASV数量.pdf", width = 4.36, height = 8.73)
+
+## 拆分数据集
+lifestyle_vec <- c('all', fun_res_count_df_1$Var1 %>% as.character())
+datasets <- lapply(lifestyle_vec, function(lifestyle){
+    if (lifestyle == 'all'){
+        otu_table_use <- otu_table
+        tax_table_use <- tax_table
+        if (length(unique(rownames(tax_table) == fun_res$asv)) > 1 || !unique(rownames(tax_table) == fun_res$asv)){
+            stop("error!")
+        }
+        tax_table_use$Lifestyle <- lapply(rownames(tax_table_use), function(asv){
+            fun_res[which(fun_res$asv == asv),]$lifestyle
+        }) %>% unlist()
+        tax_table_use$Is_saprotroph <- lapply(rownames(tax_table_use), function(asv){
+            fun_res[which(fun_res$asv == asv),]$is_saprotroph
+        }) %>% unlist()
+    }else{
+        selected_asv <- fun_res[which(fun_res$is_saprotroph == lifestyle),]$asv
+        ref_count <- fun_res_count_df_1[which(fun_res_count_df_1$Var1 == lifestyle),]$Freq
+        if (length(selected_asv) != ref_count) stop('error-1!')
+        otu_table_use <- otu_table[,selected_asv]
+        fun_res_use <- fun_res[selected_asv,]
+        tax_table_use <- tax_table[selected_asv,]
+        if (max(rowSums(otu_table_use)) == 0) stop('error-2!')
+        if (length(unique(rownames(tax_table_use) == fun_res_use$asv)) > 1 || !unique(rownames(tax_table_use) == fun_res_use$asv)){
+            stop("error!")
+        }
+        if (length(unique(rownames(tax_table_use) == colnames(otu_table_use))) > 1 || !unique(rownames(tax_table_use) == colnames(otu_table_use))){
+            stop("error!")
+        }
+        tax_table_use$Lifestyle <- fun_res_use$lifestyle
+        tax_table_use$Is_saprotroph <- fun_res_use$is_saprotroph
+    }
+    dataset <- microtable$new(otu_table = t(otu_table_use) %>% as.data.frame,
+                              sample_table = gro_table, tax_table = tax_table_use, phylo_tree = tre_table)
+    dataset$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+    dataset$tax_table %<>% .[grepl("Fungi", .$Kingdom), ]
+    dataset$tax_table %<>% tidy_taxonomy()
+    dataset$tidy_dataset()
+    dataset$cal_abund()
+    dataset$cal_alphadiv(PD = TRUE)
+    dataset$cal_betadiv(unifrac = TRUE)
+    dataset$met_table <- list(
+        env = env_table[dataset$sample_table$SampleID,],
+        sol = sol_table[dataset$sample_table$SampleID,],
+        pln = pln_table[dataset$sample_table$SampleID,],
+        drr = drr_table[dataset$sample_table$SampleID,]
+    )
+    dataset
+})
+names(datasets) <- lifestyle_vec
+saveRDS(object = datasets, file = file.path(outdir_01, "forest-gap-fun_lifetyle_dataset.Rds"))
+
+# 2. 环境参数分析
+## 创建结果目录
+outdir_02 <- createDir(rootPath = ".", dir = "results/02.env-summary")
+
+## 计算环境参数的欧式距离
+sol_eucl_dist <- sol_table %>% vegan::decostand(method = "standardize") %>% dist %>% as.matrix
+pln_eucl_dist <- pln_table %>% vegan::decostand(method = "standardize") %>% dist %>% as.matrix
+if (length(unique(rownames(dataset$sample_table) == rownames(sol_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(sol_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(sol_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(sol_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == rownames(pln_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == rownames(pln_eucl_dist))) stop("sample id order error!")
+if (length(unique(rownames(dataset$sample_table) == colnames(pln_eucl_dist))) > 1 ||
+    !unique(rownames(dataset$sample_table) == colnames(pln_eucl_dist))) stop("sample id order error!")
+dataset$beta_diversity$sol_eucl <- sol_eucl_dist
+dataset$beta_diversity$pln_eucl <- pln_eucl_dist
+
+## 环境参数的PCoA分析
+pcoa_sol <- trans_beta$new(dataset = dataset, measure = "sol_eucl", group = "Group")
+pcoa_pln <- trans_beta$new(dataset = dataset, measure = "pln_eucl", group = "Group")
+pcoa_sol$cal_ordination(ordination = "PCoA")
+pcoa_pln$cal_ordination(ordination = "PCoA")
+pcoa_sol$res_ordination$scores$GapLoc <- factor(pcoa_sol$res_ordination$scores$GapLoc, levels = args$gap_order)
+pcoa_sol$res_ordination$scores$Time <- factor(pcoa_sol$res_ordination$scores$Time, levels = args$tim_order)
+pcoa_pln$res_ordination$scores$GapLoc <- factor(pcoa_pln$res_ordination$scores$GapLoc, levels = args$gap_order)
+pcoa_pln$res_ordination$scores$Time <- factor(pcoa_pln$res_ordination$scores$Time, levels = args$tim_order)
+p_pcoa_sol <- pcoa_sol$plot_ordination(plot_color = "GapLoc", plot_shape = "Time",
+                                       plot_type = c("point"), point_size = 4, color_values = args$gap_color)
+p_pcoa_pln <- pcoa_pln$plot_ordination(plot_color = "GapLoc", plot_shape = "Time",
+                                       plot_type = c("point"), point_size = 4, color_values = args$gap_color)
+(p_pcoa_met<- ggpubr::ggarrange(p_pcoa_sol, p_pcoa_pln, labels = c('A', 'B'), common.legend = T, align = 'hv'))
+
+## 环境参数的ANOISIM检验
+pcoa_sol$cal_anosim(group = "Group", paired = TRUE)
+pcoa_pln$cal_anosim(group = "Group", paired = TRUE)
+saveMutipleXlsx(objectList = list(sol_ANOSIM = pcoa_sol$res_anosim, pln_ANOSIM = pcoa_pln$res_anosim),
+                path = outdir_02, filename = '土壤参数-根参数-欧式距离-ANOSIM检验.xlsx', row.names = F, col.names = T)
+
+## 环境参数总体组间欧式距离比较: 每一个林窗的两个时间段比较
+bet_sol <- trans_beta$new(dataset = dataset, group = "Time", measure = "sol_eucl")
+bet_pln <- trans_beta$new(dataset = dataset, group = "Time", measure = "pln_eucl")
+bet_sol$cal_group_distance(within_group = FALSE, by_group = "GapLoc")
+bet_pln$cal_group_distance(within_group = FALSE, by_group = "GapLoc")
+dist_sol <- bet_sol$res_group_distance; dist_sol$GapLoc <- factor(dist_sol$GapLoc, levels = args$gap_order)
+dist_pln <- bet_pln$res_group_distance; dist_pln$GapLoc <- factor(dist_pln$GapLoc, levels = args$gap_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+p_bet_sol <- ggplot(dist_sol, aes(x = GapLoc, y = Value)) +
+    geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+    xlab("Gap location") + ylab("Differences in Euclidean distances") +
+    scale_fill_manual(values = args$gap_color) +
+    ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.position = c(0.2, 0.62), strip.text = element_text(size = 12))
+p_bet_pln <- ggplot(dist_pln, aes(x = GapLoc, y = Value)) +
+    geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+    xlab("Gap location") + ylab("Differences in Euclidean distances") +
+    scale_fill_manual(values = args$gap_color) +
+    ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.position = c(0.2, 0.62), strip.text = element_text(size = 12))
+(p_bet_met<- ggpubr::ggarrange(p_bet_sol, p_bet_pln, labels = c('C', 'D'), common.legend = T, align = 'hv'))
+
+## 合并两张图：PCoA和欧式距离组间比较箱线图
+(p_env_beta <- cowplot::plot_grid(p_pcoa_sol + theme(legend.position = c(0.5, 0.3)),
+                                  p_pcoa_pln + theme(legend.position = 'none'),
+                                  p_bet_sol + theme(legend.position = 'none'),
+                                  p_bet_pln + theme(legend.position = 'none'),
+                                  labels = c("A", "B", "C", "D"), align = 'hv', nrow = 2))
+saved <- savePDF(object = p_env_beta, path = outdir_02, filename = "土壤参数-根参数-欧式距离-PCoA和组间距离比较.pdf",
+                 width = 8.78, height = 8.78)
+
+## 环境参数观测值的组间比较
+### 整理数据
+meta_sol <- data.frame(group = gro_table$Group, sol_table) %>% reshape2::melt()
+meta_pln <- data.frame(group = gro_table$Group, pln_table) %>% reshape2::melt()
+
+### 处理分组
+meta_sol$GapLoc <- lapply(as.character(meta_sol$group), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[1]
+}) %>% unlist
+meta_sol$Time <- lapply(as.character(meta_sol$group), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[2]
+}) %>% unlist
+meta_pln$GapLoc <- lapply(as.character(meta_pln$group), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[1]
+}) %>% unlist
+meta_pln$Time <- lapply(as.character(meta_pln$group), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[2]
+}) %>% unlist
+
+### 处理顺序
+meta_sol$GapLoc <- factor(meta_sol$GapLoc, levels = args$gap_order)
+meta_sol$Time <- factor(meta_sol$Time, levels = args$tim_order)
+meta_sol$variable <- factor(meta_sol$variable, levels = args$sol_var)
+meta_pln$GapLoc <- factor(meta_pln$GapLoc, levels = args$gap_order)
+meta_pln$Time <- factor(meta_pln$Time, levels = args$tim_order)
+meta_pln$variable <- factor(meta_pln$variable, levels = args$pln_var)
+
+### 绘制图形
+(p_sol_syms <- ggplot(meta_sol, aes(x = GapLoc, y = value)) +
+        geom_boxplot(aes(fill = Time), outlier.size = 0.5) +
+        xlab("Gap location") + ylab("Observed values") + scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(aes(group = Time), label = "p.signif", method = "wilcox.test",
+                                   vjust = 0.6, size = 4, color = 'red', hide.ns = T) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.1, 0.4), strip.text = element_text(size = 12)) +
+        facet_wrap(~variable, ncol = 6, scales = 'free_y'))
+saved <- savePDF(object = p_sol_syms, path = outdir_02, filename = "土壤参数组间比较-观测值.pdf", width = 11.65, height = 7.40)
+(p_pln_syms <- ggplot(meta_pln, aes(x = GapLoc, y = value)) +
+        geom_boxplot(aes(fill = Time), outlier.size = 0.5) +
+        xlab("Gap location") + ylab("Observed values") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(aes(group = Time), label = "p.signif", method = "wilcox.test",
+                                   vjust = 0.6, size = 4, color = 'red', hide.ns = T) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.91, 0.22), strip.text = element_text(size = 12)) +
+        facet_wrap(~variable, ncol = 4, scales = 'free_y'))
+saved <- savePDF(object = p_pln_syms, path = outdir_02, filename = "植物参数组间比较-观测值.pdf", width = 10.5, height = 7.40)
+
+## 细根降解速率分析
+drr_dat <- base::merge(x = gro_table, y = drr_table,
+                       by.x = 'SampleID', by.y = 'SampleID', all.x = T, all.y = T) %>% na.omit()
+drr_dat$GapLoc <- factor(drr_dat$GapLoc, levels = args$gap_order)
+drr_dat$Time <- factor(drr_dat$Time, levels = args$tim_order)
+compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+p_drr_bar <- ggbarplot(drr_dat, x = "GapLoc", y = "DRR", add = c("mean_sd"),label = TRUE,
+                       lab.nb.digits = 2, lab.vjust = -2.2, width = 0.7, lab.col = "red", xlab = "Gap location",
+                       ylab = "Degradation rate", fill = 'Time', position = position_dodge(0.7)) +
+    theme_gray() + ggpubr::stat_compare_means(aes(group = Time), label = "p.signif", method = "wilcox.test",
+                                              vjust = 0.6, size = 6, color = 'black', hide.ns = T) +
+    scale_fill_manual(values = args$tim_color) +
+    scale_y_continuous(labels = function(x) sprintf("%.2f", x)) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.position = c(0.1, 0.7), strip.text = element_text(size = 12), axis.title.x = element_blank())
+p_drr_box <- ggplot(drr_dat, aes(x = GapLoc, y = DRR)) +
+    geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+    xlab("Gap location") + ylab("Degradation rate") +
+    scale_fill_manual(values = args$gap_color) +
+    ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.position = 'none', strip.text = element_text(size = 12), axis.title.x = element_blank()) +
+    facet_wrap(~Time, scales = 'free_y')
+(p_drr <- ggpubr::ggarrange(p_drr_bar, p_drr_box, heights = c(2,3), nrow = 2, align = 'hv', labels = c("A", "B")))
+saved <- savePDF(object = p_drr, path = outdir_02, filename = "细根降解率分析.pdf", width = 6.14, height = 7.75)
+
+# 3. 群落组成分析
+## 创建结果目录
+outdir_03 <- createDir(rootPath = ".", dir = "results/03.comm-compos")
+
+## 整体水平上生活型的组成变化
+dataset_all <- datasets$all
+compos <- trans_abund$new(dataset = dataset_all, taxrank = "Lifestyle", ntaxa = 89999998, groupmean = "Group") # 显示所有
+compos$data_abund$GapLoc <- lapply(as.character(compos$data_abund$Sample), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[1]
+}) %>% unlist
+compos$data_abund$Time <- lapply(as.character(compos$data_abund$Sample), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[2]
+}) %>% unlist
+compos$data_abund$GapLoc <- factor(compos$data_abund$GapLoc, levels = args$gap_order)
+compos$data_abund$Time <- factor(compos$data_abund$Time, levels = args$tim_order)
+lifestyle_color <- c("#1f78b4",  "#e31a1c", "#ff7f00", "#6a3d9a", "#a6cee3", "black", "#fb9a99", "#fdbf6f",
+                     "#cab2d6", "#ffff99", "green", "darkred", "#8da0cb", "#e78ac3", "#33a02c","#a6d854", "#ffd92f", "blue","#20B2AA","gray60")
+compos$data_abund$Taxonomy[which(compos$data_abund$Taxonomy == 'unidentified')] <- "Unclassified"
+lifestyle_order <- as.character(fun_res_count_df$Var1) %>% rev
+lifestyle_order <- c(lifestyle_order[2:length(lifestyle_order)], lifestyle_order[1])
+compos$data_abund$Taxonomy <- factor(compos$data_abund$Taxonomy, levels = lifestyle_order)
+(p_compos_lifestyle <- ggplot(compos$data_abund, aes(x = Time, y = Abundance, fill = Taxonomy)) +
+        geom_bar(stat = 'identity', position = 'fill') + scale_fill_manual(name = 'Fungal lifestyle', values = lifestyle_color) +
+        xlab("Gap location") + ylab("Relative abundance (%)") +
+        guides(fill = guide_legend(ncol = 1)) + scale_y_continuous(labels = function(x) x * 100) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.title = element_text(size = 12),
+              legend.text = element_text(size = 10), legend.position = 'right') + facet_grid(~GapLoc))
+
+## 整体水平上腐生菌的组成变化
+dataset_all <- datasets$all
+compos <- trans_abund$new(dataset = dataset_all, taxrank = "Is_saprotroph", ntaxa = 89999998, groupmean = "Group") # 显示所有
+compos$data_abund$GapLoc <- lapply(as.character(compos$data_abund$Sample), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[1]
+}) %>% unlist
+compos$data_abund$Time <- lapply(as.character(compos$data_abund$Sample), function(gro){
+    res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[2]
+}) %>% unlist
+compos$data_abund$GapLoc <- factor(compos$data_abund$GapLoc, levels = args$gap_order)
+compos$data_abund$Time <- factor(compos$data_abund$Time, levels = args$tim_order)
+lifestyle_color <- c("#33a02c", "gray30")
+compos$data_abund$Taxonomy[which(compos$data_abund$Taxonomy == 'unidentified')] <- "Unclassified"
+lifestyle_order <- as.character(fun_res_count_df_1$Var1) %>% rev
+compos$data_abund$Taxonomy <- factor(compos$data_abund$Taxonomy, levels = lifestyle_order)
+(p_compos_saprotroph <- ggplot(compos$data_abund, aes(x = Time, y = Abundance, fill = Taxonomy)) +
+        geom_bar(stat = 'identity', position = 'fill') + scale_fill_manual(name = 'Fungal lifestyle', values = lifestyle_color) +
+        xlab("Gap location") + ylab("Relative abundance (%)") +
+        guides(fill = guide_legend(ncol = 1)) + scale_y_continuous(labels = function(x) x * 100) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.title = element_text(size = 12),
+              legend.text = element_text(size = 10), legend.position = 'right') + facet_grid(~GapLoc))
+(p_lifestyle_final <- ggpubr::ggarrange(p_compos_saprotroph + theme(axis.title.x = element_blank()),
+                                        p_compos_lifestyle + theme(axis.title.x = element_blank()),
+                                        heights = c(2,3), nrow = 2, align = 'hv', labels = c("A", "B")))
+saved <- savePDF(object = p_lifestyle_final, path = outdir_03, filename = "生活型组成柱状图.pdf", width = 5.78, height = 8.73)
+
+
+## 计算我们重点关注的生活型对应的物种相对丰度百分比
+datasets_use <- datasets#[!names(datasets) %in% "all"]
+compos_data_rst <- lapply(X = seq(length(datasets_use)), function(x){
+    dataset <- datasets_use[[x]]
+    compos <- trans_abund$new(dataset = dataset, taxrank = "Class", ntaxa = 89999998, groupmean = "Group") # 显示所有
+    compos$data_abund$GapLoc <- lapply(as.character(compos$data_abund$Sample), function(gro){
+        res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[1]
+    }) %>% unlist
+    compos$data_abund$Time <- lapply(as.character(compos$data_abund$Sample), function(gro){
+        res <- strsplit(gro, split = '_', fixed = T) %>% unlist; res[2]
+    }) %>% unlist
+    compos$data_abund$GapLoc <- factor(compos$data_abund$GapLoc, levels = args$gap_order)
+    compos$data_abund$Time <- factor(compos$data_abund$Time, levels = args$tim_order)
+    compos$data_abund$type <- rep(names(datasets_use)[x], nrow(compos$data_abund))
+    compos$data_abund
+}) %>% do.call('rbind', .)
+compos_data_rst$type <- factor(compos_data_rst$type, levels = c("all", "Saprotrophs", "Others"))
+(p_compos <- ggplot(compos_data_rst, aes(x = Time, y = Abundance, fill = Taxonomy)) +
+        geom_bar(stat = 'identity', position = 'fill') +
+        scale_y_continuous(labels = function(x) x * 100) +
+        scale_fill_manual(name = "Fungal class",
+                          values = c("#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF", "black", "#008000", "#000080",
+                                     "#808000", "#800080", "#008080", "#808080", "#C0C0C0", "#800000", "#808000", "#FF4500", "#FFD700",
+                                     "#32CD32", "#4682B4", "#9400D3", "#FF6347", "#20B2AA", "lightblue", "#FF1493")) +
+        xlab("Gap location") + ylab("Relative abundance (%)") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.title = element_text(size = 12),
+              legend.text = element_text(size = 10)) + facet_grid(type~GapLoc))
+
+## 韦恩图分析
+datasets_use <- datasets#[!names(datasets) %in% "all"]
+veen_rst_dat <- lapply(X = datasets_use %>% length %>% seq, function(x){
+    dataset_objc <- datasets_use[[x]]
+    dataset_name <- names(datasets_use)[x]
+    gaps <- args$gap_order
+    veen_res <- lapply(gaps, function(gap){
+        gro_table_tmp <- dataset_objc$sample_table[which(dataset_objc$sample_table$GapLoc == gap),]
+        otu_table_tmp <- dataset_objc$otu_table[,gro_table_tmp$SampleID]
+        tax_table_tmp <- dataset_objc$tax_table
+        dataset_tmp <- microtable$new(otu_table = otu_table_tmp %>% as.data.frame, sample_table = gro_table_tmp,
+                                      tax_table = tax_table_tmp)
+        dataset_tmp$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+        dataset_tmp$tax_table %<>% .[grepl("Fungi", .$Kingdom), ]
+        dataset_tmp$tax_table %<>% tidy_taxonomy()
+        dataset_tmp$tidy_dataset()
+        dataset_veen <- dataset_tmp$merge_samples(use_group = "Time")
+        t1 <- trans_venn$new(dataset_veen, ratio = NULL)
+        t1$plot_venn()
+    })
+    names(veen_res) <- gaps
+    veen_res
+})
+names(veen_rst_dat) <- names(datasets_use)
+pp_veen_all <- cowplot::plot_grid(veen_rst_dat$all$CC,veen_rst_dat$all$GC,
+                                  veen_rst_dat$all$GB,nrow = 1, align = 'hv')
+pp_veen_sap <- cowplot::plot_grid(veen_rst_dat$Saprotrophs$CC,veen_rst_dat$Saprotrophs$GC,
+                                  veen_rst_dat$Saprotrophs$GB,nrow = 1, align = 'hv')
+pp_veen_oth <- cowplot::plot_grid(veen_rst_dat$Others$CC,veen_rst_dat$Others$GC,
+                                  veen_rst_dat$Others$GB,nrow = 1, align = 'hv')
+(p_veen <- cowplot::plot_grid(pp_veen_all, pp_veen_sap, pp_veen_oth, nrow = 3, align = 'hv'))
+saved <- savePDF(object = p_veen, path = outdir_03, filename = "韦恩图.pdf", width = 9.28 * 2, height = 7.58 * 2)
+
+# 4. alpha多样性分析
+## 创建结果目录
+outdir_04 <- createDir(rootPath = '.', dir = "results/04.alpha-div")
+
+## alpha多样性比较
+alpha_div_rst <- lapply(datasets, function(dataset){
+    t_alpha <- trans_alpha$new(dataset = dataset, group = "Time", by_group = 'GapLoc')
+    t_alpha$cal_diff(method = "wilcox", p_adjust_method = 'fdr')
+    t_alpha1 <- trans_alpha$new(dataset = dataset, group = "GapLoc", by_group = 'Time')
+    t_alpha1$cal_diff(method = "wilcox", p_adjust_method = 'fdr')
+    t_alpha$data_alpha$Time <- factor(t_alpha$data_alpha$Time, levels = args$tim_order)
+    t_alpha$data_alpha$GapLoc <- factor(t_alpha$data_alpha$GapLoc, levels = args$gap_order)
+    t_alpha1$data_alpha$Time <- factor(t_alpha1$data_alpha$Time, levels = args$tim_order)
+    t_alpha1$data_alpha$GapLoc <- factor(t_alpha1$data_alpha$GapLoc, levels = args$gap_order)
+    p_alpha0 <- t_alpha$plot_alpha(measure = "Observed", add_sig_label = "P.adj") + theme_gray() +
+        xlab("Gap location") + ylab("Observed ASVs") +
+        scale_color_manual(values = args$tim_color) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.position = c(0.2, 0.2))
+    p_alpha1 <- t_alpha1$plot_alpha(measure = "Observed", add_sig_label = "Significance") + theme_gray() +
+        xlab("Gap location") + ylab("Observed ASVs") +
+        scale_color_manual(values = args$gap_color) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              strip.text = element_text(size = 12), legend.position = c(0.2, 0.2))
+    list(p_alpha0 = p_alpha0, p_alpha1 = p_alpha1)
+})
+names(alpha_div_rst) <- names(datasets)
+(p_alpha_0 <- cowplot::plot_grid(alpha_div_rst$all$p_alpha0, alpha_div_rst$Saprotrophs$p_alpha0,
+                                 alpha_div_rst$Others$p_alpha0, nrow = 3, align = 'hv', labels = c("A", "B", "C")))
+(p_alpha_1 <- cowplot::plot_grid(alpha_div_rst$all$p_alpha1, alpha_div_rst$Saprotrophs$p_alpha1,
+                                 alpha_div_rst$Others$p_alpha1, nrow = 3, align = 'hv', labels = c("A", "B", "C"))) # 都不显著，没必要保存图了
+saved <- savePDF(object = p_alpha_0, path = outdir_04, filename = "alpha多样性.pdf", width = 5.13, height = 8.73)
+
+# 5. beta多样性分析
+## 创建结果目录
+outdir_05 <- createDir(rootPath = '.', dir = "results/05.beta-div")
+
+## 基于Bray-Curtis的PCoA分析
+nmds_comm_rst <- lapply(datasets, function(dataset){
+    t_nmds_comm <- trans_beta$new(dataset = dataset, measure = "bray", group = "Group")
+    t_nmds_comm$cal_ordination(ordination = "NMDS")
+    t_nmds_comm$res_ordination$scores$GapLoc <- factor(t_nmds_comm$res_ordination$scores$GapLoc, levels = args$gap_order)
+    t_nmds_comm$res_ordination$scores$Time <- factor(t_nmds_comm$res_ordination$scores$Time, levels = args$tim_order)
+    p_nmds_comm <- t_nmds_comm$plot_ordination(plot_color = "GapLoc", plot_shape = "Time", plot_type = c("point"),
+                                               point_size = 4, color_values = args$gap_color) +
+        theme(legend.position = c(0.82, 0.7))
+})
+names(nmds_comm_rst) <- names(datasets)
+(p_beta <- cowplot::plot_grid(nmds_comm_rst$all, nmds_comm_rst$Saprotrophs,
+                              nmds_comm_rst$Others, labels = c("A", "B", "C"), nrow = 3, align = 'hv'))
+
+## 基于Bray-Curtis的ANOSIM分析
+anosim_comm_rst <- lapply(X = datasets %>% length %>% seq, function(x){
+    dataset <- datasets[[x]]
+    datname <- names(datasets)[x]
+    t_nmds_comm <- trans_beta$new(dataset = dataset, measure = "bray", group = "Group")
+    t_nmds_comm$cal_ordination(ordination = "NMDS")
+    t_nmds_comm$cal_anosim(group = "Group", paired = TRUE)
+    t_nmds_comm$res_anosim$lifestyle <- rep(datname, nrow(t_nmds_comm$res_anosim))
+    t_nmds_comm$res_anosim
+})
+names(anosim_comm_rst) <- names(datasets)
+saveMutipleXlsx(object = anosim_comm_rst, path = outdir_05,
+                filename = '群落基于Bray-Curtis的ANOSIM分析.xlsx', row.names = F, col.names = T)
+
+## 基于Bray-Curtis计算每一个林窗Mon3和Mon24之间的差异
+bet_comm_rst <- lapply(datasets, function(dataset){
+    t_bet_comm <- trans_beta$new(dataset = dataset, measure = "bray", group = "Time")
+    t_bet_comm$cal_group_distance(within_group = FALSE, by_group = "GapLoc")
+    group_dist_comms <- t_bet_comm$res_group_distance
+    group_dist_comms$GapLoc <- as.factor(group_dist_comms$GapLoc)
+    compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+    group_dist_comms$GapLoc <- factor(group_dist_comms$GapLoc, levels = args$gap_order)
+    p_bet_dist_comms <- ggplot(group_dist_comms, aes(x = GapLoc, y = Value)) +
+        geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+        xlab("Gap location") + ylab("Differences in Bray-Curtis distances") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list,
+                                   label = "p.format", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = 'none', strip.text = element_text(size = 12))
+})
+names(bet_comm_rst) <- names(datasets)
+(p_bet_dist_comms_all <- cowplot::plot_grid(bet_comm_rst$all, bet_comm_rst$Saprotrophs,
+                                            bet_comm_rst$Others, nrow = 3, align = 'hv', labels = c("A", "B", "C")))
+saved <- savePDF(object = p_bet_dist_comms_all, path = outdir_05, filename = "群落差异组间比较.pdf", width = 3.58, height = 8.73)
+
+## 比较每一个海拔Bray-Curtis的差异
+BR_rst <- lapply(datasets, function(dataset){
+    BR <- NULL
+    grodat.use <- dataset$sample_table
+    group <- grodat.use$Group %>% unique %>% as.character()
+    for (i in seq(length(group))){
+        tmpGroup <- group[i]
+        tmpSamples <- grodat.use[which(grodat.use$Group == tmpGroup),]$SampleID
+        br <- dataset$beta_diversity$bray[tmpSamples,tmpSamples] %>% as.dist() %>% as.vector()
+        gr <- strsplit(tmpGroup, split = '_', fixed = T) %>% unlist()
+        res <- data.frame(gap = rep(gr[1], length(br)), tim = rep(gr[2], length(br)), br = br)
+        BR <- rbind(BR, res)
+    }
+    BR$tim <- factor(BR$tim,levels = args$tim_order)
+    BR$gap <- factor(BR$gap, levels = args$gap_order)
+    p_BR <- ggplot(BR, aes(x = gap, y = br)) +
+        geom_boxplot(aes(fill = tim), outlier.size = 0.5) +
+        xlab("Gap location") + ylab("Bray-Curtis distances") +
+        scale_fill_manual(values = args$tim_color) +
+        ggpubr::stat_compare_means(aes(group = tim), method = 'wilcox.test', label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.6, 0.32), strip.text = element_text(size = 12))
+})
+names(BR_rst) <- names(datasets)
+(p_BR <- cowplot::plot_grid(BR_rst$all, BR_rst$Saprotrophs, BR_rst$Others, nrow = 3, align = 'hv', labels = c("D", "E", "F")))
+(p_beta_com <- cowplot::plot_grid(p_beta, p_BR, ncol = 2, align = 'hv'))
+saved <- savePDF(object = p_beta_com, path = outdir_05, filename = "群落结构分析.pdf", width = 6.52 * 1.2, height = 8.73 * 1.2)
+
+# 6. 谱系null模型
+## 创建结果目录
+outdir_06 <- createDir(rootPath = '.', dir = "results/06.phylo-null")
+
+## 计算null模型
+datasets_use <- datasets#[!names(datasets) %in% "all"]
+null_lifestyles <- lapply(X = datasets_use %>% length %>% seq, function(x){
+    dataset_name <- names(datasets_use)[x] %>% gsub(pattern = " ", replacement = "_", x = .)
+    dataset <- datasets_use[[x]]
+    outfile_name <- file.path(outdir_06, paste0('results-', dataset_name, '-fungi.Rds'))
+    if (!file.exists(outfile_name)){
+
+        # 计算ses.MNTD
+        tmp.path.sesmntd <- createDir(rootPath = outdir_06, dir = paste0('ses.mntd_fun-', dataset_name))
+        phylo.dist <- iCAMP::pdist.big(tree = dataset$phylo_tree, wd = tmp.path.sesmntd,
+                                       tree.asbig = FALSE, output = TRUE, nworker = 100, nworker.pd = 100, memory.G = 100)
+        asv.order <- rownames(dataset$otu_table)
+        asv.idx <- sapply(asv.order, function(x){which(rownames(phylo.dist) == x)})
+        phylo.dist.sig <- as.matrix(phylo.dist[asv.idx, asv.idx])
+        if (length(unique(asv.order == rownames(phylo.dist.sig))) > 1 | !unique(asv.order == rownames(phylo.dist.sig))){
+            stop("ASV IDs in ASV table can not match to those in phylogenetic distance matrix!")
+        }
+        if (length(unique(asv.order == colnames(phylo.dist.sig))) > 1 | !unique(asv.order == colnames(phylo.dist.sig))){
+            stop("ASV IDs in ASV table can not match to those in phylogenetic distance matrix!")
+        }
+        sesMNTD <- picante::ses.mntd(samp = t(dataset$otu_table), dis = phylo.dist.sig, null.model = "taxa.labels",
+                                     abundance.weighted = TRUE, runs = 999) %>% suppressMessages() %>% suppressWarnings()
+
+        # 计算betaNTI
+        tmp.path.bnti <- createDir(rootPath = outdir_06, dir = paste0('bnti_fun-', dataset_name))
+        betaNTI <- iCAMP::qpen(comm = t(dataset$otu_table), tree = dataset$phylo_tree, ab.weight = TRUE, rand.time = 999,
+                               sig.bNTI = 2, sig.rc = 0.95, nworker = 100, memory.G = 100, project = dataset_name,
+                               wd = tmp.path.bnti, output.detail = TRUE)
+
+        # 整理结果
+        null_res <- list(sesmntd = sesMNTD, bnti = betaNTI)
+        saveRDS(object = null_res, file = outfile_name)
+    }else{
+        null_res <- readRDS(outfile_name)
+    }
+    null_res
+})
+names(null_lifestyles) <- names(datasets_use)
+
+## 比较MNTD和ses.MNTD
+null_alpha_rst <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    sesmntd <- data.frame(row.names = rownames(null_obj$sesmntd),
+                          mntd = null_obj$sesmntd$mntd.obs, ses.mntd = null_obj$sesmntd$mntd.obs.z)
+    sesmntd <- sesmntd[rownames(dataset$sample_table),]
+    sesmntd <- cbind(sesmntd, dataset$sample_table)
+    dataset$alpha_diversity$MNTD <- sesmntd$mntd
+    dataset$alpha_diversity$ses.MNTD <- sesmntd$ses.mntd
+    sesmntd <- sesmntd[,c('Group', 'mntd', 'ses.mntd')] %>% reshape2::melt()
+    sesmntd$gap <- lapply(as.character(sesmntd$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[1]
+    }) %>% unlist()
+    sesmntd$tim <- lapply(as.character(sesmntd$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[2]
+    }) %>% unlist()
+    sesmntd$gap <- factor(sesmntd$gap, levels = args$gap_order)
+    sesmntd$tim <- factor(sesmntd$tim, levels = args$tim_order)
+    p_null_alpha <- ggplot(sesmntd, aes(x = gap, y = value)) +
+        geom_boxplot(aes(fill = tim), outlier.size = 0.5) +
+        xlab("Elevation (m)") + ylab("Observed values") +
+        scale_fill_manual(values = args$tim_color) +
+        ggpubr::stat_compare_means(aes(group = tim), label = "p.format", method = "wilcox.test") +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.1, 0.82), strip.text = element_text(size = 12)) +
+        facet_wrap(~variable, ncol = 1, scales = 'free_y')
+})
+names(null_alpha_rst) <- names(null_lifestyles)
+(p_null_alpha_all <- cowplot::plot_grid(null_alpha_rst$all, null_alpha_rst$Saprotrophs,
+                                        null_alpha_rst$Others, nrow = 1, align = 'hv'))
+saved <- savePDF(object = p_null_alpha_all, path = outdir_06, filename = "alpha-null-wilcox.text.pdf", width = 12.3, height = 8.73)
+
+
+## 基于bMNTD的NMDS分析
+pcoa_bmntd_rst <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    bmntd <- null_obj$bnti$bMNTD
+    dataset$beta_diversity$bmntd <- bmntd
+    t_pcoa_bmntd <- trans_beta$new(dataset = dataset, measure = "bmntd", group = "Group")
+    t_pcoa_bmntd$cal_ordination(ordination = "NMDS")
+    t_pcoa_bmntd$res_ordination$scores$GapLoc <- factor(t_pcoa_bmntd$res_ordination$scores$GapLoc, levels = args$gap_order)
+    t_pcoa_bmntd$res_ordination$scores$Time <- factor(t_pcoa_bmntd$res_ordination$scores$Time, levels = args$tim_order)
+    p_pcoa_bmntd <- t_pcoa_bmntd$plot_ordination(plot_color = "GapLoc",plot_shape = "Time",
+                                                 plot_type = c("point"), point_size = 4, color_values = args$gap_color) +
+        theme(legend.position = c(0.82, 0.7))
+})
+names(pcoa_bmntd_rst) <- names(datasets)
+(p_beta_bmntd <- cowplot::plot_grid(pcoa_bmntd_rst$all, pcoa_bmntd_rst$Saprotrophs,
+                                    pcoa_bmntd_rst$Others, nrow = 3, align = 'hv'))
+
+## 基于bMNTD的ANOSIM分析
+anosim_bmntd <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    t_pcoa_bmntd <- trans_beta$new(dataset = dataset, measure = "bmntd", group = "Group")
+    t_pcoa_bmntd$cal_ordination(ordination = "NMDS")
+    t_pcoa_bmntd$cal_anosim(group = "Group", paired = TRUE)
+    t_pcoa_bmntd$res_anosim$type <- rep('type', nrow(t_pcoa_bmntd$res_anosim))
+    t_pcoa_bmntd$res_anosim
+})
+names(anosim_bmntd) <- names(null_lifestyles)
+saveMutipleXlsx(object = anosim_bmntd, path = outdir_06, filename = '群落基于bMNTD的ANOSIM分析.xlsx', row.names = F, col.names = T)
+
+## 基于bMNTD计算每一个gap的mon3和mon24之间的差异
+bet_dist_mntd_rst <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    t_bet_mntd <- trans_beta$new(dataset = dataset, measure = "bmntd", group = "Time")
+    t_bet_mntd$cal_group_distance(within_group = FALSE, by_group = "GapLoc")
+    group_dist_mntd <- t_bet_mntd$res_group_distance; group_dist_mntd$GapLoc <- as.factor(group_dist_mntd$GapLoc)
+    compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+    group_dist_mntd$GapLoc <- factor(group_dist_mntd$GapLoc, levels = args$gap_order)
+    p_bet_dist_mntd <- ggplot(group_dist_mntd, aes(x = GapLoc, y = Value)) +
+        geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+        xlab("GapLoc") + ylab("Differences in bMNTD") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = 'none', strip.text = element_text(size = 12))
+})
+names(bet_dist_mntd_rst) <- names(null_lifestyles)
+(p_bet_dist_mntd_all <- cowplot::plot_grid(bet_dist_mntd_rst$all, bet_dist_mntd_rst$Saprotrophs,
+                                           bet_dist_mntd_rst$Others, nrow = 3, align = 'hv'))
+saved <- savePDF(object = p_bet_dist_mntd_all, path = outdir_06, filename = "bMNTD差异组间比较.pdf", width = 3.58, height = 8.73)
+
+## 基于bNTI计算每一个gap的mon3和mon24之间的差异
+bet_dist_nti_rst <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    null.res <- null_obj$bnti$result
+    nti <- parallel::mclapply(X = dataset$sample_table$SampleID, mc.cores = 100, FUN = function(sample1){
+        tmp.res <- lapply(X = dataset$sample_table$SampleID, function(sample2){
+            if (sample2 == sample1) {
+                bnti <- NA
+            }else{
+                bnti <- null.res[which(null.res$sample1 == sample1 & null.res$sample2 == sample2),]$bNTI
+                if (length(bnti) == 0) {
+                    bnti <- null.res[which(null.res$sample1 == sample2 & null.res$sample2 == sample1),]$bNTI
+                }
+            }
+            bnti
+        }) %>% unlist()
+        tmp.res.df <- data.frame(row.names = dataset$sample_table$SampleID, nti = tmp.res) %>% t()
+        rownames(tmp.res.df) <- sample1
+        tmp.res.df
+    }) %>% do.call("rbind", .) %>% as.matrix() %>% round(digits = 6)
+    dataset$beta_diversity$nti <- nti
+    t_bet_nti <- trans_beta$new(dataset = dataset, measure = "nti", group = "Time")
+    t_bet_nti$cal_group_distance(within_group = FALSE, by_group = "GapLoc")
+    group_dist_nti <- t_bet_nti$res_group_distance; group_dist_nti$GapLoc <- as.factor(group_dist_nti$GapLoc)
+    compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+    group_dist_nti$GapLoc <- factor(group_dist_nti$GapLoc, levels = args$gap_order)
+    p_bet_dist_nti <- ggplot(group_dist_nti, aes(x = GapLoc, y = Value)) +
+        geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+        geom_hline(yintercept = -2, linetype = 2, color = 'blue') +
+        geom_hline(yintercept = 2, linetype = 2, color = 'blue') +
+        xlab("GapLoc") + ylab("Differences in bNTI") +
+        scale_fill_manual(values = args$gap_color) +
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.format", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = "none", strip.text = element_text(size = 12))
+})
+names(bet_dist_nti_rst) <- names(null_lifestyles)
+(p_bet_dist_nti_all <- cowplot::plot_grid(bet_dist_nti_rst$all, bet_dist_nti_rst$Saprotrophs,
+                                          bet_dist_nti_rst$Others, nrow = 3, align = 'hv'))
+saved <- savePDF(object = p_bet_dist_nti_all, path = outdir_06, filename = "bNTI差异组间比较.pdf", width = 3.58, height = 8.73)
+
+## 绘制群落构建基础图
+comm_assemb_rst <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    grodat.use <- dataset$sample_table
+    group <- grodat.use$Group %>% unique %>% as.character()
+    nullRst <- null_obj$bnti$result
+    bMNTD <- bNTI <- EP <- NULL
+    for (i in seq(length(group))){
+        tmpGroup <- group[i]
+        tmpSamples <- grodat.use[which(grodat.use$Group == tmpGroup),]$SampleID
+        tmpNullObject <- nullRst[which(nullRst$sample1 %in% tmpSamples & nullRst$sample2 %in% tmpSamples),]
+        tmpNTI <- data.frame(bNTI = tmpNullObject$bNTI, Group = rep(tmpGroup, length(tmpNullObject$bNTI)))
+        tmpMNTD <- data.frame(bMNTD = tmpNullObject$bMNTD, Group = rep(tmpGroup, length(tmpNullObject$bMNTD)))
+        tmpProcessRaw <- as.data.frame(table(tmpNullObject$process))
+        tmpProcess <- data.frame(Process = tmpProcessRaw$Var1, Freq = tmpProcessRaw$Freq, Group = rep(tmpGroup, nrow(tmpProcessRaw)))
+        bNTI <- rbind(bNTI, tmpNTI)
+        bMNTD <- rbind(bMNTD, tmpMNTD)
+        EP <- rbind(EP, tmpProcess)
+    }
+    bMNTD$GapLoc <- lapply(as.character(bMNTD$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[1]
+    }) %>% unlist()
+    bMNTD$Time <- lapply(as.character(bMNTD$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[2]
+    }) %>% unlist()
+    bNTI$GapLoc <- lapply(as.character(bNTI$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[1]
+    }) %>% unlist()
+    bNTI$Time <- lapply(as.character(bNTI$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[2]
+    }) %>% unlist()
+    EP$GapLoc <- lapply(as.character(EP$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[1]
+    }) %>% unlist()
+    EP$Time <- lapply(as.character(EP$Group), function(gro){
+        tmp <- strsplit(gro, split = '_', fixed = T) %>% unlist()
+        tmp[2]
+    }) %>% unlist()
+    all_processes <- c("Heterogeneous.Selection", "Homogeneous.Selection","Dispersal.Limitation", "Homogenizing.Dispersal", "Undominated")
+    for (pro in all_processes){
+        if (!pro %in% EP$Process){
+            EP <- rbind(EP, data.frame(Process = pro, Freq = 0, Group = "GC_Mon.3", GapLoc = "GC", Time = "Mon.3")) # 保证每一个子图中图例颜色一致
+        }
+    }
+    EP$Process <- factor(EP$Process, levels = all_processes)
+    bMNTD$Time <- factor(bMNTD$Time, levels = args$tim_order)
+    bNTI$Time <- factor(bNTI$Time, levels = args$tim_order)
+    EP$Time <- factor(EP$Time, levels = args$tim_order)
+    EP$GapLoc <- factor(EP$GapLoc, levels = args$gap_order)
+    bMNTD$GapLoc <- factor(bMNTD$GapLoc, levels = args$gap_order)
+    bNTI$GapLoc <- factor(bNTI$GapLoc, levels = args$gap_order)
+    p_bMNTD <- ggplot(bMNTD, aes(x = GapLoc, y = bMNTD)) +
+        geom_boxplot(aes(fill = Time), outlier.size = 0.5) +
+        xlab("Elevation (m)") + ylab("bMNTD") +
+        scale_fill_manual(values = args$tim_color) +
+        ggpubr::stat_compare_means(aes(group = Time), method = 'wilcox.test', label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.6, 0.32), strip.text = element_text(size = 12))
+    p_bNTI <- ggplot(bNTI, aes(x = GapLoc, y = bNTI)) +
+        geom_boxplot(aes(fill = Time), outlier.size = 0.5) +
+        geom_hline(yintercept = -2, linetype = 2, color ='blue') +
+        geom_hline(yintercept = 2, linetype = 2, color ='blue') +
+        xlab("Elevation (m)") + ylab("bNTI") +
+        scale_fill_manual(values = args$tim_color) +
+        ggpubr::stat_compare_means(aes(group = Time), method = 'wilcox.test', label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.6, 0.32), strip.text = element_text(size = 12))
+    ep_color <- c("#1f78b4", "blue","#33a02c", "#ff7f00", "gray70")
+    p_EP <- ggplot(EP, aes(x = Time, y = Freq, fill = Process)) +
+        geom_bar(stat = 'identity', position = 'fill') +
+        scale_y_continuous(labels = function(x) x * 100) +
+        xlab("Elevation (m)") + ylab("Process") +
+        scale_fill_manual(values = ep_color) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.6, 0.32), strip.text = element_text(size = 12)) +
+        facet_wrap(~GapLoc)
+    res <- list(bmntd = p_bMNTD, bnti = p_bNTI, ep = p_EP)
+})
+names(comm_assemb_rst) <- names(null_lifestyles)
+(p_mntd_all <- cowplot::plot_grid(comm_assemb_rst$all$bmntd, comm_assemb_rst$Saprotrophs$bmntd,
+                                  comm_assemb_rst$Others$bmntd, nrow = 3, align = 'hv'))
+(p_bnti_all <- cowplot::plot_grid(comm_assemb_rst$all$bnti, comm_assemb_rst$Saprotrophs$bnti,
+                                  comm_assemb_rst$Others$bnti, nrow = 3, align = 'hv'))
+(p_epss_all <- cowplot::plot_grid(comm_assemb_rst$all$ep, comm_assemb_rst$Saprotrophs$ep,
+                                  comm_assemb_rst$Others$ep, nrow = 3, align = 'hv'))
+saved <- savePDF(object = p_mntd_all, path = outdir_06, filename = "bMNTD.pdf", width = 3.58, height = 8.73)
+saved <- savePDF(object = p_bnti_all, path = outdir_06, filename = "bNTI.pdf", width = 3.58, height = 8.73)
+saved <- savePDF(object = p_epss_all, path = outdir_06, filename = "EP.pdf", width = 3.58, height = 8.73)
+
+## 绘制组间的生态过程图
+comm_assemb_rst_ep <- lapply(X = null_lifestyles %>% length %>% seq, function(x){
+    null_obj <- null_lifestyles[[x]]
+    null_nam <- names(null_lifestyles)[x]
+    dataset <- datasets[[null_nam]]
+    grodat.use <- dataset$sample_table
+    group <- grodat.use$Group %>% unique %>% as.character()
+    process <- null_obj$bnti$result[,c('sample1', 'sample2', 'process')]
+    ele_vec <- c("CC", "GC", "GB")
+    tmp_rst <- lapply(ele_vec, function(ele){
+        samples_tab <- dataset$sample_table[which(dataset$sample_table$GapLoc == ele),]
+        ns_sample <- samples_tab[which(samples_tab$Time == "Mon.3"),]$SampleID %>% as.character()
+        cs_sample <- samples_tab[which(samples_tab$Time == "Mon.24"),]$SampleID %>% as.character()
+        process_tmp <- NULL
+        for (i in seq(nrow(process))){
+            sample1 <- process[i,]$sample1
+            sample2 <- process[i,]$sample2
+            if ((sample1 %in% ns_sample & sample2 %in% cs_sample) | (sample2 %in% ns_sample & sample1 %in% cs_sample)){
+                process_tmp <- rbind(process_tmp, process[i,])
+            }
+        }
+        process_tmp <- as.data.frame(table(process_tmp$process))
+        all_processes <- c("Heterogeneous.Selection", "Homogeneous.Selection","Dispersal.Limitation", "Homogenizing.Dispersal", "Undominated")
+        for (pro in all_processes){
+            if (!pro %in% process_tmp$Var1){
+                process_tmp <- rbind(process_tmp, data.frame(Var1 = pro, Freq = 0)) # 保证每一个子图中图例颜色一致
+            }
+        }
+        process_tmp$gap <- rep(ele, nrow(process_tmp))
+        process_tmp
+    }) %>% do.call('rbind', .)
+    tmp_rst$type <- rep(null_nam, nrow(tmp_rst))
+    tmp_rst
+}) %>% do.call('rbind', .)
+comm_assemb_rst_ep$Var1 <- factor(comm_assemb_rst_ep$Var1,
+                                  levels = c("Heterogeneous.Selection", "Homogeneous.Selection","Dispersal.Limitation", "Homogenizing.Dispersal", "Undominated"))
+comm_assemb_rst_ep$type <- factor(comm_assemb_rst_ep$type, levels = c('all', "Saprotrophs", "Others"))
+ep_color <- c("#1f78b4", "blue","#33a02c", "#ff7f00", "gray70")
+comm_assemb_rst_ep$gap <- factor(comm_assemb_rst_ep$gap, levels = args$gap_order)
+(p_ep_new <- ggplot(comm_assemb_rst_ep, aes(x = gap, y = Freq, fill = Var1)) +
+        geom_bar(stat = 'identity', position = 'fill') +
+        scale_y_continuous(labels = function(x) x * 100) +
+        xlab("Elevation (m)") + ylab("Community assembling process (%)") +
+        scale_fill_manual(values = ep_color) +
+        theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12),
+              legend.position = 'top', strip.text = element_text(size = 14), legend.text = element_text(size = 12)) +
+        facet_wrap(~type))
+saved <- savePDF(object = p_ep_new, path = outdir_06, filename = "EP-组间.pdf", width = 11.17, height = 10.10)
+
+
+## 计算周转和嵌套 (https://www.jianshu.com/p/fdd1607a09a1)
+# 加载包并使用beta.div.comp函数进行计算
+rep_nest_rst <- lapply(datasets, function(dataset){
+    gros <- dataset$sample_table
+    otus <- dataset$otu_table %>% t()
+    gaps <- unique(gros$GapLoc)
+    comp_rst <- lapply(X = gaps, function(gap){
+
+        # 计算
+        library(adespatial)
+        library(reshape2)
+        samples <- gros[which(gros$GapLoc == gap),]$SampleID
+        otu <- otus[samples,]; otu <- otu[,apply(otu, 2, sum) > 0]
+        gro <- gros[samples,]
+        data = otu
+        out1 <- beta.div.comp(data, coef ='J', quant = FALSE) # Jaccard
+
+        # 样本对之间的相异指数计算
+        D <- as.matrix(out1$D)
+        diag(D) <- "NA"
+        D[upper.tri(D)] <- "NA"
+        D1=melt(D)
+        D1=subset(D1,!D1$value=="NA")
+
+        # 样本对之间的物种替换（repl）
+        repl <- as.matrix(out1$repl)
+        diag(repl) <- "NA"
+        repl[upper.tri(repl)] <- "NA"
+        repl1=melt(repl)
+        repl1=subset(repl1,!repl1$value=="NA")
+
+        # 样本对之间的丰富度差异（nest）
+        nest <- as.matrix(out1$rich)
+        diag(nest) <- "NA"
+        nest[upper.tri(nest)] <- "NA"
+        nest1=melt(nest)
+        nest1=subset(nest1,!nest1$value=="NA")
+
+        # 合并数据nest-repl至data.frame：
+        dff=merge(D1,repl1,by=c("Var1","Var2"))
+        dff=merge(dff,nest1,by=c("Var1","Var2"))
+        colnames(dff)=c("site1","site2","D","repl","nest")
+        dff$site=paste(dff$site1,dff$site2,sep="_")
+
+        ## 添加Time分组
+        dff$group.tim.sample1 <- as.character(dff$site1)
+        dff$group.tim.sample2 <- as.character(dff$site2)
+        dff$group.tim.sample1[which(dff$group.tim.sample1 %in% gro[which(gro$Time == "Mon.3"), ]$SampleID)] <- "Mon.3"
+        dff$group.tim.sample1[which(dff$group.tim.sample1 %in% gro[which(gro$Time == "Mon.24"), ]$SampleID)] <- "Mon.24"
+        dff$group.tim.sample2[which(dff$group.tim.sample2 %in% gro[which(gro$Time == "Mon.3"), ]$SampleID)] <- "Mon.3"
+        dff$group.tim.sample2[which(dff$group.tim.sample2 %in% gro[which(gro$Time == "Mon.24"), ]$SampleID)] <- "Mon.24"
+        dff$group <- paste0(dff$group.tim.sample1, ".vs.", dff$group.tim.sample2)
+        dff$group[which(dff$group == "Mon.24.vs.Mon.3")] <- "Mon.3.vs.Mon.24"
+
+        ## 处理绘图数据
+        dff$D <- as.numeric(dff$D)
+        dff$repl <- as.numeric(dff$repl)
+        dff$nest <- as.numeric(dff$nest)
+        dff$repl.ratio <- dff$repl/dff$D
+        dff$nest.ratio <- dff$nest/dff$D
+        dff$type <- lapply(X = nrow(dff), function(x){
+            repl.ratio <- dff[x,]$repl.ratio
+            nest.ratio <- dff[x,]$nest.ratio
+            if (repl.ratio > 0.5 & repl.ratio > nest.ratio){
+                tag <- "Turnover"
+            }else if(nest.ratio > 0.5 & nest.ratio > repl.ratio){
+                tag <- "Nest"
+            }else{
+                tag <- "UD"
+            }
+            tag
+        }) %>% unlist()
+        dff$group <- factor(dff$group, levels = c("Mon.3.vs.Mon.3", "Mon.3.vs.Mon.24", "Mon.24.vs.Mon.24"))
+        dff$GapLoc <- rep(gap, nrow(dff))
+        dff
+    }) %>% do.call('rbind', .)
+    compare_list <- list(c('CC', 'GC'), c('GC', 'GB'), c('CC', 'GB'))
+    comp_rst$GapLoc <- factor(comp_rst$GapLoc, levels = args$gap_order)
+    pp1 <- ggplot(comp_rst[which(comp_rst$group == 'Mon.3.vs.Mon.24'),], aes(x = GapLoc, y = repl.ratio)) +
+        geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+        xlab("Time") + ylab("replacement ratio") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.2, 0.62), strip.text = element_text(size = 12))
+    pp2 <- ggplot(comp_rst[which(comp_rst$group == 'Mon.3.vs.Mon.24'),], aes(x = GapLoc, y = nest.ratio)) +
+        geom_boxplot(aes(fill = GapLoc), outlier.size = 0.5) +
+        xlab("Time") + ylab("nest ratio") +
+        ggpubr::stat_compare_means(method = 'wilcox.test', comparisons = compare_list, label = "p.signif", hide.ns = FALSE) +
+        theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+              legend.position = c(0.2, 0.62), strip.text = element_text(size = 12))
+    cowplot::plot_grid(pp1, pp2, nrow = 1)
+})
+names(rep_nest_rst) <- names(datasets)
+(p_bet_nest_repl <- cowplot::plot_grid(rep_nest_rst$all, rep_nest_rst$Saprotrophs,
+                                       rep_nest_rst$Others, nrow = 3, align = 'hv'))
+saved <- savePDF(object = p_bet_nest_repl, path = outdir_06, filename = "组间嵌套周转.pdf", width = 7.58, height = 8.73)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

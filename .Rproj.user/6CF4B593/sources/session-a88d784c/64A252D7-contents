@@ -1,0 +1,26 @@
+# 导入必要的包
+library(ggplot2)
+
+# 创建一个随机的数据集，假设它符合正态分布
+data <- rnorm(100)
+
+# 对数据进行排序
+sorted_data <- sort(data)
+
+# 计算标准化秩百分位数
+n <- length(sorted_data)
+rank_percent <- ((1:n) - 0.5) / n
+
+# 计算对应的正态分布累积概率
+norm_percent <- pnorm(sorted_data)
+
+# 创建数据框
+df <- data.frame(rank_percent, norm_percent)
+
+# 绘制 Sheppard Plot
+ggplot(df, aes(x = rank_percent, y = norm_percent)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    labs(x = "标准化秩百分位数", y = "正态分布累积概率") +
+    ggtitle("Sheppard Plot: Normality Check") +
+    theme_minimal()
